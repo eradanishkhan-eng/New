@@ -544,29 +544,46 @@ async def record_referral(inviter_id: int, invitee_id: int) -> bool:
         return False
     loop = asyncio.get_event_loop()
     now = get_utc_now().isoformat()
+    # Step 1: save the referral record (used for deduplication)
     ok = await loop.run_in_executor(None, fb_set, f"{DB_REFERRALS}/{inviter_id}/{invitee_id}", {"invitee_id": invitee_id, "date": now})
     if not ok:
         return False
     settings = await get_settings()
     reward = int(settings.get("referral_reward", 1))
+    # Step 2: atomically increment referrer's counters
     ok = await loop.run_in_executor(None, _atomic_increment_referral, inviter_id, reward)
     if ok:
         _user_cache.pop(f"user_{inviter_id}", None)
         await _increment_stat("total_referrals", 1)
         await _log_action("referral_success", {"inviter": inviter_id, "invitee": invitee_id, "reward": reward})
-        logger.info("Referral recorded: inviter=%s invitee=%s", inviter_id, invitee_id)
+        logger.info("Referral recorded: inviter=%s invitee=%s reward=%s", inviter_id, invitee_id, reward)
+    else:
+        # Step 2 failed — rollback Step 1 so this referral can be retried later.
+        # Without rollback, referral_exists() would always return True for this pair
+        # and the referrer would permanently lose their point.
+        await loop.run_in_executor(None, fb_delete, f"{DB_REFERRALS}/{inviter_id}/{invitee_id}")
+        logger.error(
+            "Referral point increment failed for inviter=%s invitee=%s — rolled back referral record so it can be retried",
+            inviter_id, invitee_id,
+        )
     return ok
 
 def _atomic_increment_referral(user_id: int, reward: int) -> bool:
     try:
         ref = firebase_db.reference(f"{DB_USERS}/{user_id}")
+        aborted = [False]
         def updater(current):
             if current is None:
+                # User not found in DB — abort transaction safely
+                aborted[0] = True
                 return None
             current["referral_count"] = int(current.get("referral_count", 0)) + 1
             current["referral_points"] = int(current.get("referral_points", 0)) + reward
             return current
         ref.transaction(updater)
+        if aborted[0]:
+            logger.error("Referral transaction aborted: user %s not found in DB at time of update", user_id)
+            return False
         return True
     except Exception as e:
         logger.error("Atomic referral increment failed for %s: %s", user_id, e)
@@ -581,6 +598,23 @@ async def has_pending_claim(user_id: int) -> bool:
         if isinstance(claim, dict) and int(claim.get("user_id", 0)) == user_id and claim.get("status") == CLAIM_PENDING:
             return True
     return False
+
+def _atomic_reset_and_increment_claims(user_id: int) -> bool:
+    """Atomically reset referral counters and increment total_claims after a claim is submitted."""
+    try:
+        ref = firebase_db.reference(f"{DB_USERS}/{user_id}")
+        def updater(current):
+            if current is None:
+                return None
+            current["referral_count"] = 0
+            current["referral_points"] = 0
+            current["total_claims"] = int(current.get("total_claims", 0)) + 1
+            return current
+        ref.transaction(updater)
+        return True
+    except Exception as e:
+        logger.error("Claim reset/increment failed for %s: %s", user_id, e)
+        return False
 
 async def create_claim_request(user_id: int, username: Optional[str], full_name: str, points_used: int) -> Optional[str]:
     if await has_pending_claim(user_id):
@@ -597,7 +631,8 @@ async def create_claim_request(user_id: int, username: Optional[str], full_name:
     ok = await loop.run_in_executor(None, fb_set, f"{DB_CLAIMS}/{request_id}", claim_data)
     if not ok:
         return None
-    await loop.run_in_executor(None, fb_update, _build_user_path(user_id), {"referral_count": 0, "referral_points": 0, "claim_count": 0})
+    # Atomically reset referral counters and increment total_claims
+    await loop.run_in_executor(None, _atomic_reset_and_increment_claims, user_id)
     _user_cache.pop(f"user_{user_id}", None)
     await _increment_stat("claims/pending", 1)
     await _increment_stat("claims/total", 1)
@@ -924,7 +959,14 @@ async def _process_referral(referrer_id: int, invitee_id: int, bot: Bot) -> None
     success = await record_referral(referrer_id, invitee_id)
     if success:
         try:
-            await bot.send_message(chat_id=referrer_id, text="🎉 <b>New Referral!</b>\n\nSomeone joined using your referral link!\n\n<b>+1 Point added to your account.</b> 🌟\n\nKeep sharing to earn more points!", parse_mode="HTML")
+            settings = await get_settings()
+            reward = int(settings.get("referral_reward", 1))
+            point_word = "Points" if reward != 1 else "Point"
+            await bot.send_message(
+                chat_id=referrer_id,
+                text=f"🎉 <b>New Referral!</b>\n\nSomeone joined using your referral link!\n\n<b>+{reward} {point_word} added to your account.</b> 🌟\n\nKeep sharing to earn more points!",
+                parse_mode="HTML",
+            )
         except Exception as e:
             logger.debug("Could not notify referrer %s: %s", referrer_id, e)
 
