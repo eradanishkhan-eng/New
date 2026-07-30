@@ -1078,9 +1078,11 @@ def _build_force_join_keyboard(unjoined: list) -> InlineKeyboardMarkup:
 async def send_force_join_message(target: Any, unjoined: list) -> None:
     """Send (or answer with) the force-join panel."""
     text = (
-        "🔒 <b>Subscription Required</b>\n\n"
-        "You must join <b>all</b> of the channels below before using this bot.\n\n"
-        "👇 <b>Click each button to join, then press Verify & Continue.</b>"
+        "🔐 <b>Access Required</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "To use this bot, you must join <b>all</b> the channels listed below.\n\n"
+        "👇 <b>Step 1:</b> Join each channel\n"
+        "✅ <b>Step 2:</b> Press <b>Verify & Continue</b>"
     )
     if isinstance(target, Message):
         await target.answer(text, parse_mode="HTML", reply_markup=_build_force_join_keyboard(unjoined))
@@ -1305,13 +1307,25 @@ async def _process_referral(referrer_id: int, invitee_id: int, bot: Bot) -> None
         try:
             settings = await get_settings()
             reward = int(settings.get("referral_reward", 1))
+            min_ref = int(settings.get("minimum_referral", 10))
             point_word = "Points" if reward != 1 else "Point"
+            # Fetch updated referrer data for accurate count
+            updated_referrer = await get_user(referrer_id)
+            current_points = int((updated_referrer or {}).get("referral_points", 0))
+            remaining = max(0, min_ref - current_points)
+            bar = progress_bar(current_points, min_ref, length=10)
             await bot.send_message(
                 chat_id=referrer_id,
                 text=(
-                    f"🎉 <b>New Referral!</b>\n\nSomeone joined using your referral link!\n\n"
-                    f"<b>+{reward} {point_word} added to your account.</b> 🌟\n\n"
-                    f"Keep sharing to earn more points!"
+                    f"🎉 <b>New Referral Confirmed!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"Someone just joined using your referral link!\n\n"
+                    f"✨ <b>+{reward} {point_word}</b> added to your balance\n"
+                    f"⭐ <b>Total Points:</b>  {current_points} / {min_ref}\n"
+                    f"📊 <b>Progress:</b>  {bar}\n"
+                    f"⏳ <b>Still need:</b>  {remaining} more\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"💡 Keep sharing your link to earn more!"
                 ),
                 parse_mode="HTML",
             )
@@ -1345,11 +1359,9 @@ async def cmd_start(message: Message, bot: Bot, command: CommandObject) -> None:
     if not referrer_id:
         # Check if a referral was saved earlier (e.g., user was blocked at first visit)
         referrer_id = await pop_pending_referral(user_id)
-    if referrer_id and is_new_user:
+    if referrer_id:
+        # Always attempt — record_referral internally prevents duplicates via referral_exists()
         await _process_referral(referrer_id, user_id, bot)
-    elif referrer_id and not is_new_user:
-        # Clean up any stale pending referral for existing users
-        await pop_pending_referral(user_id)
 
     admin = await is_admin(user_id)
     settings = await get_settings()
@@ -1360,13 +1372,20 @@ async def cmd_start(message: Message, bot: Bot, command: CommandObject) -> None:
         text = custom_welcome.replace("{name}", full_name)
     else:
         greeting = "Welcome back" if not is_new_user else "Welcome"
+        settings2 = await get_settings()
+        min_ref2 = int(settings2.get("minimum_referral", 10))
+        reward_name2 = settings2.get("claim_reward_name", "Telegram Premium")
+        reward2 = int(settings2.get("referral_reward", 1))
         text = (
-            f"👋 <b>{greeting}, {full_name}!</b>\n\n🌟 <b>{bot_name}</b>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━\n📌 <b>How It Works:</b>\n"
-            f"  • Invite friends using your referral link\n"
-            f"  • Every successful referral = <b>+1 Point</b>\n"
-            f"  • Collect <b>10 Points</b> to claim <b>Telegram Premium</b>\n\n"
-            f"🚀 Start sharing your link now!\n━━━━━━━━━━━━━━━━━━━"
+            f"👋 <b>{greeting}, {full_name}!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🌟 <b>{bot_name}</b>\n\n"
+            f"📌 <b>How It Works:</b>\n"
+            f"  1️⃣  Share your unique referral link\n"
+            f"  2️⃣  Each friend who joins = <b>+{reward2} Point</b>\n"
+            f"  3️⃣  Collect <b>{min_ref2} Points</b> → claim <b>{reward_name2}</b>!\n\n"
+            f"🚀 Use the buttons below to get started.\n"
+            f"━━━━━━━━━━━━━━━━━━━"
         )
     if admin:
         text += f"\n\n🔧 <b>Admin:</b> Send <code>/admin</code> to open Admin Panel."
@@ -1399,13 +1418,24 @@ async def show_profile(message: Message) -> None:
     total_claims = int(db_user.get("total_claims", 0))
     username_display = f"@{username}" if username else "Not set"
     progress = progress_bar(points, min_ref, length=10)
+    remaining = max(0, min_ref - points)
+    status_icon = "🟢" if points >= min_ref else "🔵"
     text = (
-        f"👤 <b>Your Profile</b>\n━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📛 <b>Name:</b>  {name}\n🔖 <b>Username:</b>  {username_display}\n"
-        f"🆔 <b>User ID:</b>  <code>{user_id}</code>\n📅 <b>Joined:</b>  {join_date}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━\n👥 <b>Total Invited:</b>  {referral_count}\n"
-        f"⭐ <b>Points:</b>  {points} / {min_ref}\n📊 <b>Progress:</b>  {progress}\n"
-        f"🎁 <b>Total Claims:</b>  {total_claims}\n━━━━━━━━━━━━━━━━━━━"
+        f"👤 <b>My Profile</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📛 <b>Name:</b>  {name}\n"
+        f"🔖 <b>Username:</b>  {username_display}\n"
+        f"🆔 <b>ID:</b>  <code>{user_id}</code>\n"
+        f"📅 <b>Joined:</b>  {join_date}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Referral Stats</b>\n\n"
+        f"👥 <b>Total Referred:</b>  {referral_count}\n"
+        f"⭐ <b>Points:</b>  {points} / {min_ref}\n"
+        f"📈 <b>Progress:</b>  {progress}\n"
+        f"⏳ <b>Needed:</b>  {remaining} more\n"
+        f"🎁 <b>Total Claims:</b>  {total_claims}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"{status_icon} {'<b>Ready to claim!</b> Tap ⭐ Telegram Premium' if points >= min_ref else f'Keep inviting! {remaining} more point(s) to go'}"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
 
@@ -1509,9 +1539,9 @@ async def callback_check_join(callback: CallbackQuery, bot: Bot) -> None:
         else:
             await update_user_profile(user_id, user.username, full_name)
 
-        # Process any pending referral
+        # Process any pending referral — always attempt, record_referral prevents duplicates
         referrer_id = await pop_pending_referral(user_id)
-        if referrer_id and is_new:
+        if referrer_id:
             await _process_referral(referrer_id, user_id, bot)
 
         success_text = f"✅ <b>All channels verified!</b>\n\nWelcome, {full_name}! You now have full access. 🎉"
@@ -1550,15 +1580,23 @@ async def show_referral(message: Message) -> None:
     remaining = max(0, min_ref - points)
     referral_link = build_referral_link(config.BOT_USERNAME, user.id)
     bar = progress_bar(points, min_ref, length=12)
+    pct = round((points / min_ref * 100) if min_ref else 0)
     text = (
-        f"👥 <b>Your Referral Dashboard</b>\n━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🔗 <b>Your Referral Link:</b>\n<code>{referral_link}</code>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━\n⭐ <b>Current Points:</b>  {points}\n"
-        f"👥 <b>Total Referrals:</b>  {referral_count}\n🏆 <b>Goal:</b>  {min_ref} points\n"
-        f"⏳ <b>Remaining:</b>  {remaining} more\n\n📊 <b>Progress:</b>\n  {bar}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━\n💡 <b>How to earn:</b>\n"
-        f"  • Share your link with friends\n  • Every new user who joins = <b>+1 Point</b>\n"
-        f"  • Reach <b>{min_ref} points</b> to claim <b>{reward_name}</b>! 🎁"
+        f"👥 <b>Referral Dashboard</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔗 <b>Your Referral Link:</b>\n"
+        f"<code>{referral_link}</code>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"⭐ <b>Points:</b>  {points} / {min_ref}  ({pct}%)\n"
+        f"👥 <b>Friends Referred:</b>  {referral_count}\n"
+        f"⏳ <b>Still Need:</b>  {remaining} more\n\n"
+        f"📊 <b>Progress:</b>\n  {bar}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <b>How to earn points:</b>\n"
+        f"  • Copy and share your link above\n"
+        f"  • Every friend who joins = <b>+1 Point</b>\n"
+        f"  • Reach <b>{min_ref} points</b> → claim <b>{reward_name}</b> 🎁\n\n"
+        f"📤 Share your link and start earning!"
     )
     await message.answer(
         text, parse_mode="HTML", reply_markup=main_menu_keyboard(), disable_web_page_preview=True
@@ -1586,19 +1624,28 @@ async def show_premium(message: Message) -> None:
     bar = progress_bar(points, min_ref, length=12)
     if points >= min_ref:
         text = (
-            f"🎉 <b>Congratulations!</b>\n\nYou have enough points to claim <b>{reward_name}</b>!\n\n"
-            f"━━━━━━━━━━━━━━━━━━━\n⭐ <b>Your Points:</b>  {points} / {min_ref}\n"
-            f"📊 <b>Progress:</b>  {bar}\n━━━━━━━━━━━━━━━━━━━\n\n👇 Press the button below to submit your claim!"
+            f"🎊 <b>You're Ready to Claim!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Congratulations! You've earned enough points to claim <b>{reward_name}</b>!\n\n"
+            f"⭐ <b>Your Points:</b>  {points} / {min_ref}\n"
+            f"📊 <b>Progress:</b>  {bar}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"👇 Press <b>🎁 Claim {reward_name}</b> to submit your request!"
         )
         await message.answer(text, parse_mode="HTML", reply_markup=claim_keyboard())
     else:
         referral_link = build_referral_link(config.BOT_USERNAME, user.id)
+        pct = round((points / min_ref * 100) if min_ref else 0)
         text = (
-            f"⭐ <b>Telegram Premium</b>\n\nInvite friends to earn points and claim Premium for free!\n\n"
-            f"━━━━━━━━━━━━━━━━━━━\n⭐ <b>Your Points:</b>  {points}\n"
-            f"🏆 <b>Required:</b>  {min_ref}\n⏳ <b>Still Need:</b>  {remaining} more\n\n"
-            f"📊 <b>Progress:</b>\n  {bar}\n\n━━━━━━━━━━━━━━━━━━━\n"
-            f"🔗 <b>Your Link:</b>\n<code>{referral_link}</code>"
+            f"⭐ <b>{reward_name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Invite friends to earn points and claim <b>{reward_name}</b> for free!\n\n"
+            f"⭐ <b>Your Points:</b>  {points} / {min_ref}  ({pct}%)\n"
+            f"⏳ <b>Still Need:</b>  {remaining} more\n\n"
+            f"📊 <b>Progress:</b>\n  {bar}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🔗 <b>Your Referral Link:</b>\n<code>{referral_link}</code>\n\n"
+            f"📤 Share this link — every friend who joins adds <b>+1 Point</b>!"
         )
         await message.answer(
             text, parse_mode="HTML", reply_markup=main_menu_keyboard(), disable_web_page_preview=True
@@ -1647,9 +1694,15 @@ async def process_claim(message: Message) -> None:
         )
         return
     await message.answer(
-        f"✅ <b>Claim Submitted Successfully!</b>\n\n🎁 Your request for <b>{reward_name}</b> has been received.\n\n"
-        f"━━━━━━━━━━━━━━━━━━━\n💡 <b>What's next?</b>\n  • Your points have been reset to 0\n"
-        f"  • Start inviting again to earn more!\n━━━━━━━━━━━━━━━━━━━\n\nThank you for using our bot! 🙏",
+        f"✅ <b>Claim Submitted!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎁 Your request for <b>{reward_name}</b> has been received and is under review.\n\n"
+        f"💡 <b>What happens next?</b>\n"
+        f"  • An admin will review your request soon\n"
+        f"  • Your points have been reset to 0\n"
+        f"  • Keep sharing your link to earn again!\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🙏 Thank you for being part of our community!",
         parse_mode="HTML", reply_markup=main_menu_keyboard(),
     )
 
