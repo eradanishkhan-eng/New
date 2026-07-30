@@ -39,6 +39,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ContentType,
 )
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
@@ -851,12 +852,57 @@ class IsAdmin(BaseFilter):
 MEMBER_STATUSES = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
 async def check_user_joined_channel(bot: Bot, user_id: int, channel_id: str) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
-        return member.status in MEMBER_STATUSES
-    except Exception as e:
-        logger.debug("Could not check membership for user=%s channel=%s: %s", user_id, channel_id, e)
-        return False
+    """
+    Returns True if user is a member/admin/creator of the channel.
+    Returns False ONLY if we are certain the user is NOT a member.
+    On ambiguous API errors (bot not admin, network issues), returns True so
+    legitimate members are never falsely blocked.
+    """
+    for attempt in range(2):
+        try:
+            member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            return member.status in MEMBER_STATUSES
+        except TelegramBadRequest as e:
+            err = str(e).lower()
+            # Definitive "not a member" responses
+            if any(x in err for x in (
+                "user not found",
+                "user_not_participant",
+                "participant_id_invalid",
+                "member list is inaccessible",
+            )):
+                return False
+            # Bot is not admin in the channel — we cannot verify; let the user through
+            if "chat_admin_required" in err or "method is available for supergroup" in err:
+                logger.warning(
+                    "Bot lacks admin rights to check membership in channel=%s — skipping check (user=%s)",
+                    channel_id, user_id,
+                )
+                return True
+            logger.warning(
+                "TelegramBadRequest checking membership user=%s channel=%s attempt=%d: %s",
+                user_id, channel_id, attempt + 1, e,
+            )
+        except TelegramForbiddenError as e:
+            # Bot was kicked from or blocked in the channel — skip silently
+            logger.warning(
+                "Bot is forbidden in channel=%s — skipping check (user=%s): %s",
+                channel_id, user_id, e,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Unexpected error checking membership user=%s channel=%s attempt=%d: %s",
+                user_id, channel_id, attempt + 1, e,
+            )
+        if attempt == 0:
+            await asyncio.sleep(0.5)
+    # After 2 failed attempts we cannot verify → do NOT falsely block the user
+    logger.error(
+        "Could not verify membership for user=%s channel=%s after 2 attempts — assuming joined",
+        user_id, channel_id,
+    )
+    return True
 
 async def get_unjoined_channels(bot: Bot, user_id: int) -> List[Dict[str, Any]]:
     channels = await get_force_join_channels()
@@ -935,8 +981,7 @@ class AuthMiddleware(BaseMiddleware):
 # ── Start Handler ─────────────────────────────────────────────────────────────
 start_router = Router(name="start")
 
-async def send_force_join_message(message: Message, unjoined: list) -> None:
-    lines = ["🔒 <b>Join Required Channels</b>\n\nYou must join all channels below before using this bot.\n"]
+def _build_force_join_keyboard(unjoined: list) -> InlineKeyboardMarkup:
     buttons = []
     for i, ch in enumerate(unjoined, 1):
         username = ch.get("channel_username", "")
@@ -945,8 +990,15 @@ async def send_force_join_message(message: Message, unjoined: list) -> None:
         link = invite or (f"https://t.me/{username}" if username else "")
         if link:
             buttons.append([InlineKeyboardButton(text=name, url=link)])
+        else:
+            # No link available — still show as non-clickable label fallback
+            buttons.append([InlineKeyboardButton(text=name, callback_data="noop")])
     buttons.append([InlineKeyboardButton(text="✅ I've Joined — Check", callback_data="check_join")])
-    await message.answer("".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+async def send_force_join_message(message: Message, unjoined: list) -> None:
+    text = "🔒 <b>Join Required Channels</b>\n\nYou must join all channels below before using this bot."
+    await message.answer(text, parse_mode="HTML", reply_markup=_build_force_join_keyboard(unjoined))
 
 async def _process_referral(referrer_id: int, invitee_id: int, bot: Bot) -> None:
     if referrer_id == invitee_id:
@@ -1049,36 +1101,82 @@ async def show_profile(message: Message) -> None:
     )
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
 
+@user_router.callback_query(F.data == "noop")
+async def callback_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
 @user_router.callback_query(F.data == "check_join")
 async def callback_check_join(callback: CallbackQuery, bot: Bot) -> None:
     user = callback.from_user
     if not user:
         await callback.answer()
         return
-    await callback.answer("🔍 Checking your membership...", show_alert=False)
+
+    # Acknowledge immediately so the button doesn't stay "loading"
+    await callback.answer("🔍 Checking your membership…", show_alert=False)
+
     unjoined = await get_unjoined_channels(bot, user.id)
+
     if unjoined:
-        channel_names = [f"@{ch.get('channel_username', '')}" if ch.get("channel_username") else "a required channel" for ch in unjoined]
-        names_str = "\n".join(f"  • {n}" for n in channel_names)
+        # Build descriptive names for missing channels
+        missing_names: List[str] = []
+        for ch in unjoined:
+            uname = ch.get("channel_username", "")
+            invite = ch.get("invite_link", "")
+            if uname:
+                missing_names.append(f"@{uname}")
+            elif invite:
+                missing_names.append(invite)
+            else:
+                missing_names.append("a required channel")
+
+        names_str = "\n".join(f"  • {n}" for n in missing_names)
+        fail_text = (
+            f"❌ <b>You haven't joined all channels yet!</b>\n\n"
+            f"Still missing:\n{names_str}\n\n"
+            f"Please join them and tap <b>I've Joined — Check</b> again."
+        )
         try:
-            await callback.message.answer(f"❌ <b>You haven't joined all channels yet!</b>\n\nStill missing:\n{names_str}\n\nPlease join them and try again.", parse_mode="HTML")
+            # Edit the existing message in-place so there's no extra message clutter
+            await callback.message.edit_text(
+                fail_text,
+                parse_mode="HTML",
+                reply_markup=_build_force_join_keyboard(unjoined),
+            )
         except Exception:
-            pass
+            try:
+                await callback.message.answer(fail_text, parse_mode="HTML",
+                                               reply_markup=_build_force_join_keyboard(unjoined))
+            except Exception:
+                pass
         return
+
+    # All channels joined — register/update user
     is_new = not await get_user(user.id)
     full_name = get_user_display_name(user)
     if is_new:
         await create_user(user.id, user.username, full_name)
     else:
         await update_user_profile(user.id, user.username, full_name)
+
     referrer_id = await pop_pending_referral(user.id)
     if referrer_id and is_new:
         await _process_referral(referrer_id, user.id, bot)
+
+    success_text = f"✅ <b>All channels joined!</b>\n\nWelcome, {full_name}! You can now use the bot. 🎉"
     try:
-        await callback.message.answer(f"✅ <b>All channels joined!</b>\n\nWelcome, {full_name}! You can now use the bot. 🎉", parse_mode="HTML", reply_markup=main_menu_keyboard())
-        await callback.message.delete()
+        await callback.message.edit_text(success_text, parse_mode="HTML")
+    except Exception:
+        pass
+    # Send the main menu as a fresh message
+    try:
+        await callback.message.answer(
+            f"👋 Welcome, {full_name}! Use the menu below to get started.",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
     except Exception as e:
-        logger.debug("Could not edit force-join message: %s", e)
+        logger.debug("Could not send welcome after force-join: %s", e)
 
 # ── Referral Handler ──────────────────────────────────────────────────────────
 referral_router = Router(name="referral")
