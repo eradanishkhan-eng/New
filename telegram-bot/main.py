@@ -1,6 +1,6 @@
 """
-Telegram Premium Referral Bot — Single File Version
-All code merged into one file for easy deployment.
+Telegram Premium Referral Bot — Fixed & Hardened Version
+Complete forced-join system with centralized middleware, no bypasses.
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -19,7 +19,7 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
@@ -29,6 +29,12 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, BaseMiddleware, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+    TelegramNetworkError,
+)
 from aiogram.filters import BaseFilter, Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -39,7 +45,6 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ContentType,
 )
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
@@ -97,6 +102,7 @@ class Config:
     BROADCAST_DELAY: float = 0.05
     CACHE_USER_TTL: int = 60
     CACHE_SETTINGS_TTL: int = 300
+    # Channel LIST cache (which channels to check) — not membership cache
     CACHE_CHANNELS_TTL: int = 120
 
     @staticmethod
@@ -185,6 +191,9 @@ MSG_ACCESS_DENIED = "🚫 <b>Access Denied</b>\n\nYou don't have permission to u
 MSG_MAINTENANCE = "🔧 <b>Bot Under Maintenance</b>\n\nWe're currently performing maintenance.\nPlease try again later. 🙏"
 MSG_BLOCKED = "🚫 <b>Account Blocked</b>\n\nYour account has been blocked.\nContact an admin if you believe this is an error."
 MSG_BOT_OFF = "🔴 <b>Bot is currently offline</b>\n\nPlease try again later."
+
+# Callback data values that bypass the forced-join check (they ARE the join flow)
+EXEMPT_CALLBACK_DATA: Set[str] = {"check_join", "noop"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -326,6 +335,7 @@ def fb_transaction(path: str, update_fn) -> bool:
 
 _user_cache: TTLCache = TTLCache(maxsize=1000, ttl=config.CACHE_USER_TTL)
 _settings_cache: TTLCache = TTLCache(maxsize=1, ttl=config.CACHE_SETTINGS_TTL)
+# Caches the LIST of required channels (config data) — NOT user membership status
 _channels_cache: TTLCache = TTLCache(maxsize=1, ttl=config.CACHE_CHANNELS_TTL)
 _admins_cache: TTLCache = TTLCache(maxsize=1, ttl=60)
 _user_locks: Dict[int, asyncio.Lock] = {}
@@ -338,7 +348,7 @@ def _get_user_lock(user_id: int) -> asyncio.Lock:
 async def get_settings() -> Dict[str, Any]:
     if "settings" in _settings_cache:
         return _settings_cache["settings"]
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, DB_SETTINGS)
     if not data:
         await loop.run_in_executor(None, fb_set, DB_SETTINGS, DEFAULT_SETTINGS)
@@ -349,7 +359,7 @@ async def get_settings() -> Dict[str, Any]:
     return merged
 
 async def update_settings(updates: Dict[str, Any]) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, fb_update, DB_SETTINGS, updates)
     if ok:
         _settings_cache.pop("settings", None)
@@ -358,7 +368,7 @@ async def update_settings(updates: Dict[str, Any]) -> bool:
 async def get_all_admin_ids() -> List[int]:
     if "admins" in _admins_cache:
         return _admins_cache["admins"]
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, DB_ADMINS)
     ids: List[int] = list(config.get_initial_admin_ids())
     if data and isinstance(data, dict):
@@ -377,7 +387,7 @@ async def is_admin(user_id: int) -> bool:
     return user_id in admins
 
 async def add_admin(user_id: int, added_by: int) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     now = get_utc_now().isoformat()
     ok = await loop.run_in_executor(None, fb_set, f"{DB_ADMINS}/{user_id}", {"added_by": added_by, "added_at": now})
     if ok:
@@ -386,7 +396,7 @@ async def add_admin(user_id: int, added_by: int) -> bool:
     return ok
 
 async def remove_admin(user_id: int, removed_by: int) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, fb_delete, f"{DB_ADMINS}/{user_id}")
     if ok:
         _admins_cache.pop("admins", None)
@@ -394,14 +404,15 @@ async def remove_admin(user_id: int, removed_by: int) -> bool:
     return ok
 
 async def get_admins_data() -> Dict[str, Any]:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, DB_ADMINS)
     return data or {}
 
 async def get_force_join_channels() -> List[Dict[str, Any]]:
+    """Returns the list of required channels (uses TTL cache for config data)."""
     if "channels" in _channels_cache:
         return _channels_cache["channels"]
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, DB_FORCE_JOIN)
     channels: List[Dict[str, Any]] = []
     if data and isinstance(data, dict):
@@ -413,7 +424,8 @@ async def get_force_join_channels() -> List[Dict[str, Any]]:
     return channels
 
 async def get_all_force_join_channels() -> List[Dict[str, Any]]:
-    loop = asyncio.get_event_loop()
+    """Same as get_force_join_channels but always bypasses cache (for admin ops)."""
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, DB_FORCE_JOIN)
     channels: List[Dict[str, Any]] = []
     if data and isinstance(data, dict):
@@ -424,7 +436,7 @@ async def get_all_force_join_channels() -> List[Dict[str, Any]]:
     return channels
 
 async def add_force_join_channel(channel_id: str, channel_username: str, invite_link: str, added_by: int) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     now = get_utc_now().isoformat()
     safe_key = sanitize_firebase_key(channel_id.lstrip("-"))
     data = {"channel_id": channel_id, "channel_username": channel_username, "invite_link": invite_link, "status": True, "added_date": now, "added_by": added_by}
@@ -435,14 +447,14 @@ async def add_force_join_channel(channel_id: str, channel_username: str, invite_
     return ok
 
 async def remove_force_join_channel(channel_key: str) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, fb_delete, f"{DB_FORCE_JOIN}/{channel_key}")
     if ok:
         _channels_cache.pop("channels", None)
     return ok
 
 async def toggle_force_join_channel(channel_key: str, enabled: bool) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, fb_update, f"{DB_FORCE_JOIN}/{channel_key}", {"status": enabled})
     if ok:
         _channels_cache.pop("channels", None)
@@ -455,7 +467,7 @@ async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
     cache_key = f"user_{user_id}"
     if cache_key in _user_cache:
         return _user_cache[cache_key]
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, _build_user_path(user_id))
     if data:
         _user_cache[cache_key] = data
@@ -472,7 +484,7 @@ async def create_user(user_id: int, username: Optional[str], full_name: str) -> 
         "claim_count": 0, "total_claims": 0, "status": USER_ACTIVE, "blocked": False,
         "language": "en", "premium_claim_history_count": 0,
     }
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, fb_set, _build_user_path(user_id), user_data)
     _user_cache[f"user_{user_id}"] = user_data
     await _increment_stat("total_users", 1)
@@ -483,18 +495,18 @@ async def create_user(user_id: int, username: Optional[str], full_name: str) -> 
     return user_data
 
 async def update_user_profile(user_id: int, username: Optional[str], full_name: str) -> None:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     updates = {"username": username or "", "full_name": full_name, "last_active": get_utc_now().isoformat()}
     await loop.run_in_executor(None, fb_update, _build_user_path(user_id), updates)
     _user_cache.pop(f"user_{user_id}", None)
 
 async def update_user_last_active(user_id: int) -> None:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, fb_update, _build_user_path(user_id), {"last_active": get_utc_now().isoformat()})
     _user_cache.pop(f"user_{user_id}", None)
 
 async def block_user(user_id: int, blocked_by: int) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, fb_update, _build_user_path(user_id), {"blocked": True, "status": USER_BLOCKED})
     if ok:
         _user_cache.pop(f"user_{user_id}", None)
@@ -502,7 +514,7 @@ async def block_user(user_id: int, blocked_by: int) -> bool:
     return ok
 
 async def unblock_user(user_id: int, unblocked_by: int) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, fb_update, _build_user_path(user_id), {"blocked": False, "status": USER_ACTIVE})
     if ok:
         _user_cache.pop(f"user_{user_id}", None)
@@ -510,7 +522,7 @@ async def unblock_user(user_id: int, unblocked_by: int) -> bool:
     return ok
 
 async def get_all_user_ids() -> List[int]:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, DB_USERS)
     if not data or not isinstance(data, dict):
         return []
@@ -520,11 +532,11 @@ async def get_user_count() -> int:
     return len(await get_all_user_ids())
 
 async def save_pending_referral(invitee_id: int, referrer_id: int) -> None:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, fb_set, f"pending_referrals/{invitee_id}", {"referrer_id": referrer_id, "ts": get_utc_now().isoformat()})
 
 async def pop_pending_referral(invitee_id: int) -> Optional[int]:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, f"pending_referrals/{invitee_id}")
     if not data or not isinstance(data, dict):
         return None
@@ -535,7 +547,7 @@ async def pop_pending_referral(invitee_id: int) -> Optional[int]:
         return None
 
 async def referral_exists(inviter_id: int, invitee_id: int) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     val = await loop.run_in_executor(None, fb_get, f"{DB_REFERRALS}/{inviter_id}/{invitee_id}")
     return val is not None
 
@@ -543,15 +555,13 @@ async def record_referral(inviter_id: int, invitee_id: int) -> bool:
     if await referral_exists(inviter_id, invitee_id):
         logger.warning("Duplicate referral blocked: inviter=%s invitee=%s", inviter_id, invitee_id)
         return False
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     now = get_utc_now().isoformat()
-    # Step 1: save the referral record (used for deduplication)
     ok = await loop.run_in_executor(None, fb_set, f"{DB_REFERRALS}/{inviter_id}/{invitee_id}", {"invitee_id": invitee_id, "date": now})
     if not ok:
         return False
     settings = await get_settings()
     reward = int(settings.get("referral_reward", 1))
-    # Step 2: atomically increment referrer's counters
     ok = await loop.run_in_executor(None, _atomic_increment_referral, inviter_id, reward)
     if ok:
         _user_cache.pop(f"user_{inviter_id}", None)
@@ -559,12 +569,9 @@ async def record_referral(inviter_id: int, invitee_id: int) -> bool:
         await _log_action("referral_success", {"inviter": inviter_id, "invitee": invitee_id, "reward": reward})
         logger.info("Referral recorded: inviter=%s invitee=%s reward=%s", inviter_id, invitee_id, reward)
     else:
-        # Step 2 failed — rollback Step 1 so this referral can be retried later.
-        # Without rollback, referral_exists() would always return True for this pair
-        # and the referrer would permanently lose their point.
         await loop.run_in_executor(None, fb_delete, f"{DB_REFERRALS}/{inviter_id}/{invitee_id}")
         logger.error(
-            "Referral point increment failed for inviter=%s invitee=%s — rolled back referral record so it can be retried",
+            "Referral point increment failed for inviter=%s invitee=%s — rolled back referral record",
             inviter_id, invitee_id,
         )
     return ok
@@ -575,7 +582,6 @@ def _atomic_increment_referral(user_id: int, reward: int) -> bool:
         aborted = [False]
         def updater(current):
             if current is None:
-                # User not found in DB — abort transaction safely
                 aborted[0] = True
                 return None
             current["referral_count"] = int(current.get("referral_count", 0)) + 1
@@ -583,7 +589,7 @@ def _atomic_increment_referral(user_id: int, reward: int) -> bool:
             return current
         ref.transaction(updater)
         if aborted[0]:
-            logger.error("Referral transaction aborted: user %s not found in DB at time of update", user_id)
+            logger.error("Referral transaction aborted: user %s not found in DB", user_id)
             return False
         return True
     except Exception as e:
@@ -591,7 +597,7 @@ def _atomic_increment_referral(user_id: int, reward: int) -> bool:
         return False
 
 async def has_pending_claim(user_id: int) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, DB_CLAIMS)
     if not data or not isinstance(data, dict):
         return False
@@ -601,7 +607,6 @@ async def has_pending_claim(user_id: int) -> bool:
     return False
 
 def _atomic_reset_and_increment_claims(user_id: int) -> bool:
-    """Atomically reset referral counters and increment total_claims after a claim is submitted."""
     try:
         ref = firebase_db.reference(f"{DB_USERS}/{user_id}")
         def updater(current):
@@ -621,7 +626,7 @@ async def create_claim_request(user_id: int, username: Optional[str], full_name:
     if await has_pending_claim(user_id):
         logger.warning("Duplicate claim attempt blocked for user %s", user_id)
         return None
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     now = get_utc_now()
     request_id = generate_request_id()
     claim_data = {
@@ -632,8 +637,14 @@ async def create_claim_request(user_id: int, username: Optional[str], full_name:
     ok = await loop.run_in_executor(None, fb_set, f"{DB_CLAIMS}/{request_id}", claim_data)
     if not ok:
         return None
-    # Atomically reset referral counters and increment total_claims
-    await loop.run_in_executor(None, _atomic_reset_and_increment_claims, user_id)
+    reset_ok = await loop.run_in_executor(None, _atomic_reset_and_increment_claims, user_id)
+    if not reset_ok:
+        # Claim record exists but points couldn't be reset — log clearly; claim is still valid
+        logger.error(
+            "Points reset FAILED for user %s after claim %s was created — "
+            "manual correction may be needed (points not deducted)",
+            user_id, request_id,
+        )
     _user_cache.pop(f"user_{user_id}", None)
     await _increment_stat("claims/pending", 1)
     await _increment_stat("claims/total", 1)
@@ -642,14 +653,14 @@ async def create_claim_request(user_id: int, username: Optional[str], full_name:
     return request_id
 
 async def get_pending_claims() -> List[Dict[str, Any]]:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, DB_CLAIMS)
     if not data or not isinstance(data, dict):
         return []
     return [v for v in data.values() if isinstance(v, dict) and v.get("status") == CLAIM_PENDING]
 
 async def get_all_claims() -> List[Dict[str, Any]]:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, DB_CLAIMS)
     if not data or not isinstance(data, dict):
         return []
@@ -658,7 +669,7 @@ async def get_all_claims() -> List[Dict[str, Any]]:
     return claims
 
 async def update_claim_status(request_id: str, status: str, admin_id: int) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     now = get_utc_now().isoformat()
     ok = await loop.run_in_executor(None, fb_update, f"{DB_CLAIMS}/{request_id}", {"status": status, "reviewed_by": admin_id, "reviewed_at": now})
     if ok:
@@ -669,16 +680,16 @@ async def update_claim_status(request_id: str, status: str, admin_id: int) -> bo
     return ok
 
 async def delete_claim(request_id: str) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, fb_delete, f"{DB_CLAIMS}/{request_id}")
 
 async def get_statistics() -> Dict[str, Any]:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, fb_get, DB_STATISTICS)
     return data or {}
 
 async def get_dashboard_stats() -> Dict[str, Any]:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     stats_raw, users_raw, claims_raw = await asyncio.gather(
         loop.run_in_executor(None, fb_get, DB_STATISTICS),
         loop.run_in_executor(None, fb_get, DB_USERS),
@@ -713,7 +724,7 @@ async def get_dashboard_stats() -> Dict[str, Any]:
     }
 
 async def save_broadcast_record(admin_id: int, total: int, delivered: int, failed: int, blocked: int, message_type: str) -> None:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     now = get_utc_now()
     record = {
         "admin_id": admin_id, "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M:%S UTC"),
@@ -724,7 +735,7 @@ async def save_broadcast_record(admin_id: int, total: int, delivered: int, faile
 
 async def _log_action(action: str, data: Dict[str, Any]) -> None:
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         entry = {"action": action, "timestamp": get_utc_now().isoformat(), **data}
         await loop.run_in_executor(None, fb_push, DB_LOGS, entry)
     except Exception as e:
@@ -732,7 +743,7 @@ async def _log_action(action: str, data: Dict[str, Any]) -> None:
 
 async def _increment_stat(key: str, delta: int) -> None:
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         path = f"{DB_STATISTICS}/{key}"
         def updater(current):
             return max(0, int(current or 0) + delta)
@@ -851,70 +862,339 @@ class IsAdmin(BaseFilter):
 
 MEMBER_STATUSES = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
+# Track channels for which we already sent an admin permission alert this session
+# (avoids spamming on every request)
+_permission_alert_sent: Set[str] = set()
+
+
+async def _notify_admins_permission_issue(bot: Bot, channel_id: str, error_detail: str) -> None:
+    """Send a one-time admin notification when bot lacks rights to check a channel."""
+    if channel_id in _permission_alert_sent:
+        return
+    _permission_alert_sent.add(channel_id)
+    admin_ids = await get_all_admin_ids()
+    alert_text = (
+        f"⚠️ <b>Bot Permission Error</b>\n\n"
+        f"The bot <b>cannot verify membership</b> in channel:\n"
+        f"<code>{channel_id}</code>\n\n"
+        f"<b>Reason:</b> {error_detail}\n\n"
+        f"<b>Action required:</b>\n"
+        f"• Make the bot an <b>administrator</b> of that channel\n"
+        f"• Or remove the channel from the force-join list\n\n"
+        f"Until fixed, <b>all users are being denied access</b> through this channel check."
+    )
+    for admin_id in admin_ids:
+        try:
+            await bot.send_message(chat_id=admin_id, text=alert_text, parse_mode="HTML")
+            logger.warning(
+                "Sent admin permission alert for channel=%s to admin=%s", channel_id, admin_id
+            )
+        except Exception as e:
+            logger.error("Failed to notify admin %s about permission issue: %s", admin_id, e)
+
+
 async def check_user_joined_channel(bot: Bot, user_id: int, channel_id: str) -> bool:
     """
-    Returns True if user is a member/admin/creator of the channel.
-    Returns False ONLY if we are certain the user is NOT a member.
-    On ambiguous API errors (bot not admin, network issues), returns True so
-    legitimate members are never falsely blocked.
+    STRICT membership check — returns True ONLY when definitely a member.
+
+    Return False (deny access) in ALL ambiguous or error cases.
+    Never assume a user is verified when the API cannot confirm it.
+
+    Error handling policy:
+      • Definitive "not a member" errors  → False
+      • Bot lacks admin rights            → False + one-time admin notification
+      • TelegramForbiddenError            → False + one-time admin notification
+      • TelegramRetryAfter (FloodWait)    → wait then retry; False if still fails
+      • Network / timeout errors          → retry; False after 3 attempts
+      • Any other exception               → False
     """
-    for attempt in range(2):
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
         try:
+            logger.debug(
+                "Force-join check: user=%s channel=%s attempt=%d", user_id, channel_id, attempt
+            )
             member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
-            return member.status in MEMBER_STATUSES
+            is_member = member.status in MEMBER_STATUSES
+            logger.debug(
+                "Force-join result: user=%s channel=%s status=%s member=%s",
+                user_id, channel_id, member.status, is_member,
+            )
+            return is_member
+
+        except TelegramRetryAfter as e:
+            wait_secs = min(e.retry_after, 10)  # cap wait to 10 s to avoid blocking middleware
+            logger.warning(
+                "FloodWait on membership check user=%s channel=%s — waiting %ds (attempt %d/%d)",
+                user_id, channel_id, wait_secs, attempt, max_attempts,
+            )
+            await asyncio.sleep(wait_secs)
+            # Don't count FloodWait as a real attempt failure; just retry
+
         except TelegramBadRequest as e:
             err = str(e).lower()
-            # Definitive "not a member" responses
+
+            # Definitive "not a member" signals — return False immediately
             if any(x in err for x in (
                 "user not found",
                 "user_not_participant",
                 "participant_id_invalid",
                 "member list is inaccessible",
+                "user is not a member",
             )):
-                return False
-            # Bot is not admin in the channel — we cannot verify; let the user through
-            if "chat_admin_required" in err or "method is available for supergroup" in err:
-                logger.warning(
-                    "Bot lacks admin rights to check membership in channel=%s — skipping check (user=%s)",
-                    channel_id, user_id,
+                logger.info(
+                    "User=%s is NOT a member of channel=%s (definitive): %s",
+                    user_id, channel_id, e,
                 )
-                return True
+                return False
+
+            # Kicked / banned
+            if any(x in err for x in ("kicked", "banned", "restricted")):
+                logger.info(
+                    "User=%s is banned/kicked/restricted in channel=%s: %s",
+                    user_id, channel_id, e,
+                )
+                return False
+
+            # Bot lacks admin rights → notify admin, deny user
+            if any(x in err for x in (
+                "chat_admin_required",
+                "method is available for supergroup",
+                "bot is not a member",
+                "need to be admin",
+            )):
+                logger.error(
+                    "Bot lacks admin rights in channel=%s — cannot verify user=%s: %s",
+                    channel_id, user_id, e,
+                )
+                asyncio.create_task(
+                    _notify_admins_permission_issue(bot, channel_id, str(e))
+                )
+                return False
+
+            # Invalid / deleted chat
+            if any(x in err for x in ("chat not found", "invalid chat id", "channel invalid")):
+                logger.error(
+                    "Channel=%s appears invalid or deleted — cannot verify user=%s: %s",
+                    channel_id, user_id, e,
+                )
+                asyncio.create_task(
+                    _notify_admins_permission_issue(bot, channel_id, f"Channel not found/invalid: {e}")
+                )
+                return False
+
             logger.warning(
-                "TelegramBadRequest checking membership user=%s channel=%s attempt=%d: %s",
-                user_id, channel_id, attempt + 1, e,
+                "TelegramBadRequest checking membership user=%s channel=%s attempt=%d/%d: %s",
+                user_id, channel_id, attempt, max_attempts, e,
             )
+
         except TelegramForbiddenError as e:
-            # Bot was kicked from or blocked in the channel — skip silently
-            logger.warning(
-                "Bot is forbidden in channel=%s — skipping check (user=%s): %s",
+            logger.error(
+                "Bot is forbidden in channel=%s — cannot verify user=%s: %s",
                 channel_id, user_id, e,
             )
-            return True
+            asyncio.create_task(
+                _notify_admins_permission_issue(
+                    bot, channel_id, f"Bot is forbidden (kicked from channel?): {e}"
+                )
+            )
+            return False
+
+        except TelegramNetworkError as e:
+            logger.warning(
+                "Network error checking membership user=%s channel=%s attempt=%d/%d: %s",
+                user_id, channel_id, attempt, max_attempts, e,
+            )
+
         except Exception as e:
             logger.warning(
-                "Unexpected error checking membership user=%s channel=%s attempt=%d: %s",
-                user_id, channel_id, attempt + 1, e,
+                "Unexpected error checking membership user=%s channel=%s attempt=%d/%d: %s",
+                user_id, channel_id, attempt, max_attempts, e,
             )
-        if attempt == 0:
-            await asyncio.sleep(0.5)
-    # After 2 failed attempts we cannot verify → do NOT falsely block the user
+
+        if attempt < max_attempts:
+            await asyncio.sleep(1.0 * attempt)  # exponential-ish back-off
+
+    # All attempts exhausted — cannot confirm membership → DENY access
     logger.error(
-        "Could not verify membership for user=%s channel=%s after 2 attempts — assuming joined",
-        user_id, channel_id,
+        "VERIFICATION FAILED for user=%s channel=%s after %d attempts — denying access (fail-closed)",
+        user_id, channel_id, max_attempts,
     )
-    return True
+    return False
+
 
 async def get_unjoined_channels(bot: Bot, user_id: int) -> List[Dict[str, Any]]:
+    """
+    Returns all enabled required channels the user has NOT joined.
+    Always performs fresh Telegram API calls — never uses cached membership data.
+    """
     channels = await get_force_join_channels()
     enabled = [ch for ch in channels if ch.get("status", True)]
+
+    if not enabled:
+        return []
+
+    logger.info("Force-join verification started: user=%s checking %d channel(s)", user_id, len(enabled))
+
     unjoined: List[Dict[str, Any]] = []
     for ch in enabled:
         cid = ch.get("channel_id", "")
         if not cid:
+            logger.warning("Skipping force-join channel with empty channel_id: %s", ch)
             continue
-        if not await check_user_joined_channel(bot, user_id, cid):
+        joined = await check_user_joined_channel(bot, user_id, cid)
+        if not joined:
             unjoined.append(ch)
+
+    if unjoined:
+        missing_ids = [ch.get("channel_id") for ch in unjoined]
+        logger.info(
+            "Force-join BLOCKED: user=%s missing channels=%s", user_id, missing_ids
+        )
+    else:
+        logger.info("Force-join PASSED: user=%s all %d channel(s) verified", user_id, len(enabled))
+
     return unjoined
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FORCE JOIN UI HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_force_join_keyboard(unjoined: list) -> InlineKeyboardMarkup:
+    buttons = []
+    for i, ch in enumerate(unjoined, 1):
+        username = ch.get("channel_username", "")
+        invite = ch.get("invite_link", "")
+        name = f"📢 @{username}" if username else f"📢 Channel {i}"
+        link = invite or (f"https://t.me/{username}" if username else "")
+        if link:
+            buttons.append([InlineKeyboardButton(text=name, url=link)])
+        else:
+            buttons.append([InlineKeyboardButton(text=name, callback_data="noop")])
+    buttons.append([InlineKeyboardButton(text="✅ I've Joined — Verify & Continue", callback_data="check_join")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_force_join_message(target: Any, unjoined: list) -> None:
+    """Send (or answer with) the force-join panel."""
+    text = (
+        "🔒 <b>Subscription Required</b>\n\n"
+        "You must join <b>all</b> of the channels below before using this bot.\n\n"
+        "👇 <b>Click each button to join, then press Verify & Continue.</b>"
+    )
+    if isinstance(target, Message):
+        await target.answer(text, parse_mode="HTML", reply_markup=_build_force_join_keyboard(unjoined))
+    elif isinstance(target, CallbackQuery) and target.message:
+        try:
+            await target.message.edit_text(
+                text, parse_mode="HTML", reply_markup=_build_force_join_keyboard(unjoined)
+            )
+        except Exception:
+            try:
+                await target.message.answer(
+                    text, parse_mode="HTML", reply_markup=_build_force_join_keyboard(unjoined)
+                )
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FORCED JOIN MIDDLEWARE  ← THE SINGLE GATEKEEPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ForcedJoinMiddleware(BaseMiddleware):
+    """
+    Centralized forced-join gating applied to ALL messages and callback queries.
+
+    Rules:
+      1. Admins always pass through (they must be able to manage the bot).
+      2. The 'check_join' and 'noop' callbacks pass through (they ARE the join flow).
+      3. If no channels are configured, everyone passes through.
+      4. Otherwise, perform a FRESH Telegram API membership check for every request.
+         If the user has not joined even one required channel → block and show join panel.
+      5. For /start messages: extract and save pending referral before blocking.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        # Determine user and bot from event
+        bot: Optional[Bot] = data.get("bot")
+        user = None
+
+        if isinstance(event, Message):
+            user = event.from_user
+        elif isinstance(event, CallbackQuery):
+            user = event.from_user
+            # Exempt callbacks that are part of the join flow itself
+            if event.data in EXEMPT_CALLBACK_DATA:
+                return await handler(event, data)
+
+        if user is None or bot is None:
+            return await handler(event, data)
+
+        user_id = user.id
+
+        # Admins always bypass forced join
+        if await is_admin(user_id):
+            return await handler(event, data)
+
+        # Load required channels list (cached config data, not membership)
+        channels = await get_force_join_channels()
+        enabled = [ch for ch in channels if ch.get("status", True)]
+
+        if not enabled:
+            # No channels configured → no restriction
+            return await handler(event, data)
+
+        # ── FRESH membership check ──────────────────────────────────────────
+        unjoined = await get_unjoined_channels(bot, user_id)
+
+        if not unjoined:
+            # All channels verified → allow through
+            return await handler(event, data)
+
+        # ── User has not joined all channels → BLOCK ────────────────────────
+        logger.info(
+            "ForcedJoinMiddleware BLOCKED user=%s (%s), missing %d channel(s)",
+            user_id,
+            getattr(user, "username", None) or getattr(user, "full_name", "?"),
+            len(unjoined),
+        )
+        await _log_action("forced_join_blocked", {
+            "user_id": user_id,
+            "missing_channels": [ch.get("channel_id") for ch in unjoined],
+        })
+
+        if isinstance(event, Message):
+            # For /start: save pending referral so it's not lost
+            msg_text = event.text or ""
+            if msg_text.startswith("/start"):
+                parts = msg_text.split(maxsplit=1)
+                start_param = parts[1].strip() if len(parts) > 1 else ""
+                referrer_id = extract_referrer_id(start_param)
+                if referrer_id and referrer_id != user_id:
+                    await save_pending_referral(user_id, referrer_id)
+                    logger.debug(
+                        "Saved pending referral: invitee=%s referrer=%s (user not joined yet)",
+                        user_id, referrer_id,
+                    )
+            await send_force_join_message(event, unjoined)
+
+        elif isinstance(event, CallbackQuery):
+            try:
+                await event.answer(
+                    "⚠️ You must join all required channels first!", show_alert=True
+                )
+            except Exception:
+                pass
+            await send_force_join_message(event, unjoined)
+
+        return None  # Block the handler
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MIDDLEWARES
@@ -923,8 +1203,14 @@ async def get_unjoined_channels(bot: Bot, user_id: int) -> List[Dict[str, Any]]:
 _last_seen: TTLCache = TTLCache(maxsize=10_000, ttl=max(config.THROTTLE_RATE * 10, 10))
 THROTTLE_WARN_AFTER = 5
 
+
 class ThrottlingMiddleware(BaseMiddleware):
-    async def __call__(self, handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]], event: TelegramObject, data: Dict[str, Any]) -> Any:
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
         if not isinstance(event, Message):
             return await handler(event, data)
         message: Message = event
@@ -940,39 +1226,63 @@ class ThrottlingMiddleware(BaseMiddleware):
             _last_seen[user_id] = (last_time, drop_count)
             if drop_count == THROTTLE_WARN_AFTER:
                 try:
-                    await message.answer("⚠️ <b>Slow down!</b>\n\nYou're sending messages too fast. Please wait a moment.", parse_mode="HTML")
+                    await message.answer(
+                        "⚠️ <b>Slow down!</b>\n\nYou're sending messages too fast. Please wait a moment.",
+                        parse_mode="HTML",
+                    )
                 except Exception:
                     pass
             return None
         _last_seen[user_id] = (now, 0)
         return await handler(event, data)
 
+
 class AuthMiddleware(BaseMiddleware):
-    async def __call__(self, handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]], event: TelegramObject, data: Dict[str, Any]) -> Any:
-        if not isinstance(event, Message):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        # Resolve user from either Message or CallbackQuery
+        if isinstance(event, Message):
+            user = event.from_user
+        elif isinstance(event, CallbackQuery):
+            user = event.from_user
+        else:
             return await handler(event, data)
-        message: Message = event
-        user = message.from_user
+
         if user is None:
             return await handler(event, data)
+
         user_id = user.id
         try:
             settings = await get_settings()
             if not settings.get("bot_status", True):
                 if not await is_admin(user_id):
-                    await message.answer(MSG_BOT_OFF)
+                    if isinstance(event, Message):
+                        await event.answer(MSG_BOT_OFF)
+                    elif isinstance(event, CallbackQuery):
+                        await event.answer("🔴 Bot is currently offline.", show_alert=True)
                     return None
             if settings.get("maintenance", False):
                 if not await is_admin(user_id):
-                    await message.answer(MSG_MAINTENANCE)
+                    if isinstance(event, Message):
+                        await event.answer(MSG_MAINTENANCE)
+                    elif isinstance(event, CallbackQuery):
+                        await event.answer("🔧 Bot under maintenance. Please try again later.", show_alert=True)
                     return None
             db_user = await get_user(user_id)
             if db_user and db_user.get("blocked", False):
-                await message.answer(MSG_BLOCKED)
+                if isinstance(event, Message):
+                    await event.answer(MSG_BLOCKED)
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("🚫 Your account has been blocked.", show_alert=True)
                 return None
         except Exception as e:
             logger.error("AuthMiddleware error for user %s: %s", user_id, e)
         return await handler(event, data)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTERS / HANDLERS
@@ -981,24 +1291,6 @@ class AuthMiddleware(BaseMiddleware):
 # ── Start Handler ─────────────────────────────────────────────────────────────
 start_router = Router(name="start")
 
-def _build_force_join_keyboard(unjoined: list) -> InlineKeyboardMarkup:
-    buttons = []
-    for i, ch in enumerate(unjoined, 1):
-        username = ch.get("channel_username", "")
-        invite = ch.get("invite_link", "")
-        name = f"📢 @{username}" if username else f"📢 Channel {i}"
-        link = invite or (f"https://t.me/{username}" if username else "")
-        if link:
-            buttons.append([InlineKeyboardButton(text=name, url=link)])
-        else:
-            # No link available — still show as non-clickable label fallback
-            buttons.append([InlineKeyboardButton(text=name, callback_data="noop")])
-    buttons.append([InlineKeyboardButton(text="✅ I've Joined — Check", callback_data="check_join")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-async def send_force_join_message(message: Message, unjoined: list) -> None:
-    text = "🔒 <b>Join Required Channels</b>\n\nYou must join all channels below before using this bot."
-    await message.answer(text, parse_mode="HTML", reply_markup=_build_force_join_keyboard(unjoined))
 
 async def _process_referral(referrer_id: int, invitee_id: int, bot: Bot) -> None:
     if referrer_id == invitee_id:
@@ -1016,41 +1308,54 @@ async def _process_referral(referrer_id: int, invitee_id: int, bot: Bot) -> None
             point_word = "Points" if reward != 1 else "Point"
             await bot.send_message(
                 chat_id=referrer_id,
-                text=f"🎉 <b>New Referral!</b>\n\nSomeone joined using your referral link!\n\n<b>+{reward} {point_word} added to your account.</b> 🌟\n\nKeep sharing to earn more points!",
+                text=(
+                    f"🎉 <b>New Referral!</b>\n\nSomeone joined using your referral link!\n\n"
+                    f"<b>+{reward} {point_word} added to your account.</b> 🌟\n\n"
+                    f"Keep sharing to earn more points!"
+                ),
                 parse_mode="HTML",
             )
         except Exception as e:
             logger.debug("Could not notify referrer %s: %s", referrer_id, e)
 
+
 @start_router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot, command: CommandObject) -> None:
+    """
+    /start handler — the ForcedJoinMiddleware has already verified membership
+    before this handler runs. No need to re-check here.
+    Referral from start param is processed (pending referral was saved by middleware if needed).
+    """
     user = message.from_user
     if not user:
         return
     user_id = user.id
     full_name = get_user_display_name(user)
     username = user.username
-    unjoined = await get_unjoined_channels(bot, user_id)
-    if unjoined:
-        start_param_early = command.args or ""
-        referrer_id_early = extract_referrer_id(start_param_early)
-        if referrer_id_early and referrer_id_early != user_id:
-            await save_pending_referral(user_id, referrer_id_early)
-        await send_force_join_message(message, unjoined)
-        return
+
     is_new_user = not await user_exists(user_id)
     if is_new_user:
         await create_user(user_id, username, full_name)
     else:
         await update_user_profile(user_id, username, full_name)
+
+    # Process referral — check both inline param and pending referral
     start_param = command.args or ""
     referrer_id = extract_referrer_id(start_param)
+    if not referrer_id:
+        # Check if a referral was saved earlier (e.g., user was blocked at first visit)
+        referrer_id = await pop_pending_referral(user_id)
     if referrer_id and is_new_user:
         await _process_referral(referrer_id, user_id, bot)
+    elif referrer_id and not is_new_user:
+        # Clean up any stale pending referral for existing users
+        await pop_pending_referral(user_id)
+
     admin = await is_admin(user_id)
     settings = await get_settings()
     custom_welcome = settings.get("welcome_message", "")
     bot_name = settings.get("bot_name", "Telegram Premium Referral Bot")
+
     if custom_welcome:
         text = custom_welcome.replace("{name}", full_name)
     else:
@@ -1065,11 +1370,14 @@ async def cmd_start(message: Message, bot: Bot, command: CommandObject) -> None:
         )
     if admin:
         text += f"\n\n🔧 <b>Admin:</b> Send <code>/admin</code> to open Admin Panel."
+
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
     logger.info("User %s (%s) started bot. New=%s", full_name, user_id, is_new_user)
 
-# ── User Handler ──────────────────────────────────────────────────────────────
+
+# ── User Handlers ──────────────────────────────────────────────────────────────
 user_router = Router(name="user")
+
 
 @user_router.message(F.text == BTN_PROFILE)
 async def show_profile(message: Message) -> None:
@@ -1101,85 +1409,129 @@ async def show_profile(message: Message) -> None:
     )
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
 
+
 @user_router.callback_query(F.data == "noop")
 async def callback_noop(callback: CallbackQuery) -> None:
     await callback.answer()
 
+
+# Per-user locks for verify flow — prevents race conditions from rapid taps.
+# WeakValueDictionary auto-cleans entries once no coroutine holds the lock.
+import weakref
+_verify_locks: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+
+def _get_verify_lock(user_id: int) -> asyncio.Lock:
+    lock = _verify_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _verify_locks[user_id] = lock
+    return lock
+
+
 @user_router.callback_query(F.data == "check_join")
 async def callback_check_join(callback: CallbackQuery, bot: Bot) -> None:
+    """
+    Handles the 'Verify & Continue' button.
+    Uses a per-user lock to prevent race conditions from rapid taps.
+    Always performs a FRESH membership check — no cached data.
+    """
     user = callback.from_user
     if not user:
         await callback.answer()
         return
 
-    # Acknowledge immediately so the button doesn't stay "loading"
-    await callback.answer("🔍 Checking your membership…", show_alert=False)
+    user_id = user.id
+    lock = _get_verify_lock(user_id)
 
-    unjoined = await get_unjoined_channels(bot, user.id)
-
-    if unjoined:
-        # Build descriptive names for missing channels
-        missing_names: List[str] = []
-        for ch in unjoined:
-            uname = ch.get("channel_username", "")
-            invite = ch.get("invite_link", "")
-            if uname:
-                missing_names.append(f"@{uname}")
-            elif invite:
-                missing_names.append(invite)
-            else:
-                missing_names.append("a required channel")
-
-        names_str = "\n".join(f"  • {n}" for n in missing_names)
-        fail_text = (
-            f"❌ <b>You haven't joined all channels yet!</b>\n\n"
-            f"Still missing:\n{names_str}\n\n"
-            f"Please join them and tap <b>I've Joined — Check</b> again."
-        )
-        try:
-            # Edit the existing message in-place so there's no extra message clutter
-            await callback.message.edit_text(
-                fail_text,
-                parse_mode="HTML",
-                reply_markup=_build_force_join_keyboard(unjoined),
-            )
-        except Exception:
-            try:
-                await callback.message.answer(fail_text, parse_mode="HTML",
-                                               reply_markup=_build_force_join_keyboard(unjoined))
-            except Exception:
-                pass
+    # If another verify is in progress for this user, drop this tap
+    if lock.locked():
+        await callback.answer("⏳ Already checking, please wait…", show_alert=False)
         return
 
-    # All channels joined — register/update user
-    is_new = not await get_user(user.id)
-    full_name = get_user_display_name(user)
-    if is_new:
-        await create_user(user.id, user.username, full_name)
-    else:
-        await update_user_profile(user.id, user.username, full_name)
+    async with lock:
+        # Acknowledge immediately so the button doesn't stay "loading"
+        await callback.answer("🔍 Verifying your membership…", show_alert=False)
 
-    referrer_id = await pop_pending_referral(user.id)
-    if referrer_id and is_new:
-        await _process_referral(referrer_id, user.id, bot)
+        logger.info("Verify button pressed by user=%s — performing fresh membership check", user_id)
 
-    success_text = f"✅ <b>All channels joined!</b>\n\nWelcome, {full_name}! You can now use the bot. 🎉"
-    try:
-        await callback.message.edit_text(success_text, parse_mode="HTML")
-    except Exception:
-        pass
-    # Send the main menu as a fresh message
-    try:
-        await callback.message.answer(
-            f"👋 Welcome, {full_name}! Use the menu below to get started.",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
+        unjoined = await get_unjoined_channels(bot, user_id)
+
+        if unjoined:
+            # Build descriptive names for missing channels
+            missing_names: List[str] = []
+            for ch in unjoined:
+                uname = ch.get("channel_username", "")
+                invite = ch.get("invite_link", "")
+                if uname:
+                    missing_names.append(f"@{uname}")
+                elif invite:
+                    missing_names.append(invite)
+                else:
+                    missing_names.append("a required channel")
+
+            names_str = "\n".join(f"  • {n}" for n in missing_names)
+            fail_text = (
+                f"❌ <b>Not all channels joined yet!</b>\n\n"
+                f"Still missing:\n{names_str}\n\n"
+                f"Please join them and tap <b>Verify & Continue</b> again."
+            )
+            logger.info(
+                "Verify FAILED for user=%s — still missing: %s",
+                user_id, [ch.get("channel_id") for ch in unjoined],
+            )
+            try:
+                await callback.message.edit_text(
+                    fail_text,
+                    parse_mode="HTML",
+                    reply_markup=_build_force_join_keyboard(unjoined),
+                )
+            except Exception:
+                try:
+                    await callback.message.answer(
+                        fail_text,
+                        parse_mode="HTML",
+                        reply_markup=_build_force_join_keyboard(unjoined),
+                    )
+                except Exception:
+                    pass
+            return
+
+        # ── All channels verified → grant access ────────────────────────────
+        logger.info(
+            "Verify SUCCESS for user=%s — all channels joined, granting access", user_id
         )
-    except Exception as e:
-        logger.debug("Could not send welcome after force-join: %s", e)
+        await _log_action("forced_join_passed", {"user_id": user_id})
+
+        full_name = get_user_display_name(user)
+        is_new = not await get_user(user_id)
+        if is_new:
+            await create_user(user_id, user.username, full_name)
+        else:
+            await update_user_profile(user_id, user.username, full_name)
+
+        # Process any pending referral
+        referrer_id = await pop_pending_referral(user_id)
+        if referrer_id and is_new:
+            await _process_referral(referrer_id, user_id, bot)
+
+        success_text = f"✅ <b>All channels verified!</b>\n\nWelcome, {full_name}! You now have full access. 🎉"
+        try:
+            await callback.message.edit_text(success_text, parse_mode="HTML")
+        except Exception:
+            pass
+        try:
+            await callback.message.answer(
+                f"👋 Welcome, {full_name}! Use the menu below to get started.",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception as e:
+            logger.debug("Could not send welcome after force-join verification: %s", e)
+
 
 # ── Referral Handler ──────────────────────────────────────────────────────────
 referral_router = Router(name="referral")
+
 
 @referral_router.message(F.text == BTN_REFER)
 async def show_referral(message: Message) -> None:
@@ -1208,10 +1560,14 @@ async def show_referral(message: Message) -> None:
         f"  • Share your link with friends\n  • Every new user who joins = <b>+1 Point</b>\n"
         f"  • Reach <b>{min_ref} points</b> to claim <b>{reward_name}</b>! 🎁"
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
+    await message.answer(
+        text, parse_mode="HTML", reply_markup=main_menu_keyboard(), disable_web_page_preview=True
+    )
+
 
 # ── Premium Handler ────────────────────────────────────────────────────────────
 premium_router = Router(name="premium")
+
 
 @premium_router.message(F.text == BTN_PREMIUM)
 async def show_premium(message: Message) -> None:
@@ -1244,7 +1600,10 @@ async def show_premium(message: Message) -> None:
             f"📊 <b>Progress:</b>\n  {bar}\n\n━━━━━━━━━━━━━━━━━━━\n"
             f"🔗 <b>Your Link:</b>\n<code>{referral_link}</code>"
         )
-        await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
+        await message.answer(
+            text, parse_mode="HTML", reply_markup=main_menu_keyboard(), disable_web_page_preview=True
+        )
+
 
 @premium_router.message(F.text == BTN_CLAIM)
 async def process_claim(message: Message) -> None:
@@ -1261,14 +1620,31 @@ async def process_claim(message: Message) -> None:
     points = int(db_user.get("referral_points", 0))
     if points < min_ref:
         remaining = min_ref - points
-        await message.answer(f"❌ <b>Not enough points!</b>\n\n⭐ <b>You have:</b>  {points} points\n🏆 <b>Required:</b>  {min_ref} points\n⏳ <b>Need:</b>  {remaining} more\n\nKeep inviting friends to earn more points! 💪", parse_mode="HTML", reply_markup=main_menu_keyboard())
+        await message.answer(
+            f"❌ <b>Not enough points!</b>\n\n⭐ <b>You have:</b>  {points} points\n"
+            f"🏆 <b>Required:</b>  {min_ref} points\n⏳ <b>Need:</b>  {remaining} more\n\n"
+            f"Keep inviting friends to earn more points! 💪",
+            parse_mode="HTML", reply_markup=main_menu_keyboard(),
+        )
         return
     if await has_pending_claim(user.id):
-        await message.answer(f"⏳ <b>Request Already Submitted</b>\n\nYour claim for <b>{reward_name}</b> has been submitted.\nPlease continue inviting friends while we process it! 🙌", parse_mode="HTML", reply_markup=main_menu_keyboard())
+        await message.answer(
+            f"⏳ <b>Request Already Submitted</b>\n\nYour claim for <b>{reward_name}</b> has been submitted.\n"
+            f"Please continue inviting friends while we process it! 🙌",
+            parse_mode="HTML", reply_markup=main_menu_keyboard(),
+        )
         return
-    request_id = await create_claim_request(user_id=user.id, username=user.username, full_name=db_user.get("full_name", user.full_name or ""), points_used=points)
+    request_id = await create_claim_request(
+        user_id=user.id,
+        username=user.username,
+        full_name=db_user.get("full_name", user.full_name or ""),
+        points_used=points,
+    )
     if not request_id:
-        await message.answer("⚠️ Something went wrong. Please try again later.", parse_mode="HTML", reply_markup=main_menu_keyboard())
+        await message.answer(
+            "⚠️ Something went wrong. Please try again later.",
+            parse_mode="HTML", reply_markup=main_menu_keyboard(),
+        )
         return
     await message.answer(
         f"✅ <b>Claim Submitted Successfully!</b>\n\n🎁 Your request for <b>{reward_name}</b> has been received.\n\n"
@@ -1277,9 +1653,11 @@ async def process_claim(message: Message) -> None:
         parse_mode="HTML", reply_markup=main_menu_keyboard(),
     )
 
+
 # ── Admin Dashboard ────────────────────────────────────────────────────────────
 admin_dashboard_router = Router(name="admin_dashboard")
 _BOT_START_TIME = time.time()
+
 
 def _format_uptime() -> str:
     elapsed = int(time.time() - _BOT_START_TIME)
@@ -1293,6 +1671,7 @@ def _format_uptime() -> str:
     parts.append(f"{seconds}s")
     return " ".join(parts) or "0s"
 
+
 @admin_dashboard_router.message(Command("admin"))
 async def cmd_admin(message: Message) -> None:
     user = message.from_user
@@ -1301,7 +1680,11 @@ async def cmd_admin(message: Message) -> None:
     if not await is_admin(user.id):
         await message.answer(MSG_ACCESS_DENIED, parse_mode="HTML")
         return
-    await message.answer("🔧 <b>Admin Panel</b>\n\nWelcome to the admin panel. Select an option:", parse_mode="HTML", reply_markup=admin_main_keyboard())
+    await message.answer(
+        "🔧 <b>Admin Panel</b>\n\nWelcome to the admin panel. Select an option:",
+        parse_mode="HTML", reply_markup=admin_main_keyboard(),
+    )
+
 
 @admin_dashboard_router.message(IsAdmin(), F.text == BTN_ADMIN_DASHBOARD)
 async def show_dashboard(message: Message) -> None:
@@ -1330,12 +1713,15 @@ async def show_dashboard(message: Message) -> None:
         logger.error("Dashboard error: %s", e)
         await message.answer("⚠️ Failed to load dashboard. Please try again.", parse_mode="HTML")
 
+
 @admin_dashboard_router.message(IsAdmin(), F.text == BTN_ADMIN_BACK)
 async def admin_back(message: Message) -> None:
     await message.answer("🔙 Returned to main menu.", parse_mode="HTML", reply_markup=main_menu_keyboard())
 
+
 # ── Admin Requests ─────────────────────────────────────────────────────────────
 admin_requests_router = Router(name="admin_requests")
+
 
 def _format_claim_card(claim: dict, index: int, total: int) -> str:
     return (
@@ -1348,69 +1734,114 @@ def _format_claim_card(claim: dict, index: int, total: int) -> str:
         f"⭐ <b>Points Used:</b>  {claim.get('points_used', 0)}\n━━━━━━━━━━━━━━━━━━━"
     )
 
+
 def _request_action_keyboard(request_id: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=f"✅ Approve:{request_id}"), KeyboardButton(text=f"❌ Reject:{request_id}")], [KeyboardButton(text=f"🗑 Delete:{request_id}")], [KeyboardButton(text=BTN_ADMIN_BACK)]],
+        keyboard=[
+            [KeyboardButton(text=f"✅ Approve:{request_id}"), KeyboardButton(text=f"❌ Reject:{request_id}")],
+            [KeyboardButton(text=f"🗑 Delete:{request_id}")],
+            [KeyboardButton(text=BTN_ADMIN_BACK)],
+        ],
         resize_keyboard=True, one_time_keyboard=False,
     )
+
 
 @admin_requests_router.message(IsAdmin(), F.text == BTN_ADMIN_REQUESTS)
 async def show_requests(message: Message) -> None:
     pending = await get_pending_claims()
     if not pending:
-        await message.answer("📭 <b>No Pending Requests</b>\n\nThere are no pending Premium claims.", parse_mode="HTML", reply_markup=admin_main_keyboard())
+        await message.answer(
+            "📭 <b>No Pending Requests</b>\n\nThere are no pending Premium claims.",
+            parse_mode="HTML", reply_markup=admin_main_keyboard(),
+        )
         return
     pending.sort(key=lambda x: x.get("timestamp", ""))
-    await message.answer(f"📋 <b>Pending Requests: {len(pending)}</b>\n\nUse the action buttons below each request.\n━━━━━━━━━━━━━━━━━━━", parse_mode="HTML", reply_markup=admin_main_keyboard())
+    await message.answer(
+        f"📋 <b>Pending Requests: {len(pending)}</b>\n\nUse the action buttons below each request.\n━━━━━━━━━━━━━━━━━━━",
+        parse_mode="HTML", reply_markup=admin_main_keyboard(),
+    )
     for i, claim in enumerate(pending, 1):
-        await message.answer(_format_claim_card(claim, i, len(pending)), parse_mode="HTML", reply_markup=_request_action_keyboard(claim.get("request_id", "")))
+        await message.answer(
+            _format_claim_card(claim, i, len(pending)),
+            parse_mode="HTML",
+            reply_markup=_request_action_keyboard(claim.get("request_id", "")),
+        )
+
 
 @admin_requests_router.message(IsAdmin(), F.text.startswith("✅ Approve:"))
 async def approve_request(message: Message, bot: Bot) -> None:
     request_id = message.text.split(":", 1)[1].strip()
     ok = await update_claim_status(request_id, CLAIM_APPROVED, message.from_user.id)
     if ok:
-        await message.answer(f"✅ <b>Request Approved</b>\n\nRequest <code>{request_id}</code> has been approved.", parse_mode="HTML", reply_markup=admin_main_keyboard())
+        await message.answer(
+            f"✅ <b>Request Approved</b>\n\nRequest <code>{request_id}</code> has been approved.",
+            parse_mode="HTML", reply_markup=admin_main_keyboard(),
+        )
     else:
         await message.answer("⚠️ Failed to approve request. It may have already been processed.", parse_mode="HTML")
+
 
 @admin_requests_router.message(IsAdmin(), F.text.startswith("❌ Reject:"))
 async def reject_request(message: Message) -> None:
     request_id = message.text.split(":", 1)[1].strip()
     ok = await update_claim_status(request_id, CLAIM_REJECTED, message.from_user.id)
     if ok:
-        await message.answer(f"❌ <b>Request Rejected</b>\n\nRequest <code>{request_id}</code> has been rejected.", parse_mode="HTML", reply_markup=admin_main_keyboard())
+        await message.answer(
+            f"❌ <b>Request Rejected</b>\n\nRequest <code>{request_id}</code> has been rejected.",
+            parse_mode="HTML", reply_markup=admin_main_keyboard(),
+        )
     else:
         await message.answer("⚠️ Failed to reject request.", parse_mode="HTML")
+
 
 @admin_requests_router.message(IsAdmin(), F.text.startswith("🗑 Delete:"))
 async def delete_request(message: Message) -> None:
     request_id = message.text.split(":", 1)[1].strip()
     ok = await delete_claim(request_id)
     if ok:
-        await message.answer(f"🗑 <b>Request Deleted</b>\n\nRequest <code>{request_id}</code> has been deleted.", parse_mode="HTML", reply_markup=admin_main_keyboard())
+        await message.answer(
+            f"🗑 <b>Request Deleted</b>\n\nRequest <code>{request_id}</code> has been deleted.",
+            parse_mode="HTML", reply_markup=admin_main_keyboard(),
+        )
     else:
         await message.answer("⚠️ Failed to delete request.", parse_mode="HTML")
 
+
 # ── Admin Broadcast ────────────────────────────────────────────────────────────
 admin_broadcast_router = Router(name="admin_broadcast")
+
 
 class BroadcastState(StatesGroup):
     waiting_for_message = State()
     confirming = State()
 
-SUPPORTED_CONTENT_TYPES = {ContentType.TEXT, ContentType.PHOTO, ContentType.VIDEO, ContentType.ANIMATION, ContentType.STICKER, ContentType.VOICE, ContentType.DOCUMENT, ContentType.AUDIO}
+
+SUPPORTED_CONTENT_TYPES = {
+    ContentType.TEXT, ContentType.PHOTO, ContentType.VIDEO,
+    ContentType.ANIMATION, ContentType.STICKER, ContentType.VOICE,
+    ContentType.DOCUMENT, ContentType.AUDIO,
+}
+
 
 @admin_broadcast_router.message(IsAdmin(), F.text == BTN_ADMIN_BROADCAST)
 async def broadcast_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("📢 <b>Broadcast Panel</b>\n\nSend messages to all users at once.\n\nChoose target audience:", parse_mode="HTML", reply_markup=admin_broadcast_keyboard())
+    await message.answer(
+        "📢 <b>Broadcast Panel</b>\n\nSend messages to all users at once.\n\nChoose target audience:",
+        parse_mode="HTML", reply_markup=admin_broadcast_keyboard(),
+    )
+
 
 @admin_broadcast_router.message(IsAdmin(), F.text == BTN_BROADCAST_ALL)
 async def start_broadcast_all(message: Message, state: FSMContext) -> None:
     await state.set_state(BroadcastState.waiting_for_message)
     await state.update_data(target="all")
-    await message.answer("📝 <b>Send Your Broadcast Message</b>\n\nForward or send any message to broadcast.\nSupported: Text, Photo, Video, GIF, Sticker, Voice, Document, Audio\n\nPress ❌ Cancel to abort.", parse_mode="HTML", reply_markup=admin_cancel_keyboard())
+    await message.answer(
+        "📝 <b>Send Your Broadcast Message</b>\n\nForward or send any message to broadcast.\n"
+        "Supported: Text, Photo, Video, GIF, Sticker, Voice, Document, Audio\n\nPress ❌ Cancel to abort.",
+        parse_mode="HTML", reply_markup=admin_cancel_keyboard(),
+    )
+
 
 @admin_broadcast_router.message(IsAdmin(), BroadcastState.waiting_for_message)
 async def receive_broadcast_message(message: Message, state: FSMContext) -> None:
@@ -1424,7 +1855,12 @@ async def receive_broadcast_message(message: Message, state: FSMContext) -> None
     await state.update_data(from_chat_id=message.chat.id, message_id=message.message_id, content_type=message.content_type)
     await state.set_state(BroadcastState.confirming)
     user_ids = await get_all_user_ids()
-    await message.answer(f"📋 <b>Broadcast Preview Received</b>\n\n👥 <b>Recipients:</b>  {len(user_ids):,} users\n📄 <b>Type:</b>  {message.content_type}\n\nAre you sure?", parse_mode="HTML", reply_markup=admin_confirm_broadcast_keyboard())
+    await message.answer(
+        f"📋 <b>Broadcast Preview Received</b>\n\n👥 <b>Recipients:</b>  {len(user_ids):,} users\n"
+        f"📄 <b>Type:</b>  {message.content_type}\n\nAre you sure?",
+        parse_mode="HTML", reply_markup=admin_confirm_broadcast_keyboard(),
+    )
+
 
 @admin_broadcast_router.message(IsAdmin(), BroadcastState.confirming, F.text == BTN_CONFIRM)
 async def confirm_broadcast(message: Message, state: FSMContext, bot: Bot) -> None:
@@ -1438,7 +1874,10 @@ async def confirm_broadcast(message: Message, state: FSMContext, bot: Bot) -> No
     if total == 0:
         await message.answer("⚠️ No users to broadcast to.", parse_mode="HTML", reply_markup=admin_main_keyboard())
         return
-    status_msg = await message.answer(f"📢 <b>Broadcast Started</b>\n\nSending to {total:,} users...\n⏳ Please wait.", parse_mode="HTML", reply_markup=admin_main_keyboard())
+    status_msg = await message.answer(
+        f"📢 <b>Broadcast Started</b>\n\nSending to {total:,} users...\n⏳ Please wait.",
+        parse_mode="HTML", reply_markup=admin_main_keyboard(),
+    )
     delivered = failed = blocked = 0
     for i, user_id in enumerate(user_ids):
         try:
@@ -1453,45 +1892,69 @@ async def confirm_broadcast(message: Message, state: FSMContext, bot: Bot) -> No
         if (i + 1) % 50 == 0 and status_msg:
             try:
                 pct = round((i + 1) / total * 100, 1)
-                await status_msg.edit_text(f"📢 <b>Broadcasting...</b>\n\nProgress: {i + 1}/{total} ({pct}%)\n✅ Delivered: {delivered}\n🚫 Blocked: {blocked}\n❌ Failed: {failed}", parse_mode="HTML")
+                await status_msg.edit_text(
+                    f"📢 <b>Broadcasting...</b>\n\nProgress: {i + 1}/{total} ({pct}%)\n"
+                    f"✅ Delivered: {delivered}\n🚫 Blocked: {blocked}\n❌ Failed: {failed}",
+                    parse_mode="HTML",
+                )
             except Exception:
                 pass
         await asyncio.sleep(config.BROADCAST_DELAY)
-    await save_broadcast_record(admin_id=message.from_user.id, total=total, delivered=delivered, failed=failed, blocked=blocked, message_type=content_type)
-    report_text = f"📢 <b>Broadcast Complete!</b>\n\n━━━━━━━━━━━━━━━━━━━\n👥 <b>Total Recipients:</b>  {total:,}\n✅ <b>Delivered:</b>  {delivered:,}\n🚫 <b>Blocked:</b>  {blocked:,}\n❌ <b>Failed:</b>  {failed:,}\n📊 <b>Success Rate:</b>  {round(delivered / total * 100, 1) if total else 0}%\n━━━━━━━━━━━━━━━━━━━"
+    await save_broadcast_record(
+        admin_id=message.from_user.id, total=total, delivered=delivered,
+        failed=failed, blocked=blocked, message_type=content_type,
+    )
+    report_text = (
+        f"📢 <b>Broadcast Complete!</b>\n\n━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>Total Recipients:</b>  {total:,}\n✅ <b>Delivered:</b>  {delivered:,}\n"
+        f"🚫 <b>Blocked:</b>  {blocked:,}\n❌ <b>Failed:</b>  {failed:,}\n"
+        f"📊 <b>Success Rate:</b>  {round(delivered / total * 100, 1) if total else 0}%\n━━━━━━━━━━━━━━━━━━━"
+    )
     try:
         await status_msg.edit_text(report_text, parse_mode="HTML")
     except Exception:
         await message.answer(report_text, parse_mode="HTML")
+
 
 @admin_broadcast_router.message(IsAdmin(), BroadcastState.confirming, F.text.in_({BTN_CANCEL, BTN_BROADCAST_CANCEL}))
 async def cancel_broadcast(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("❌ Broadcast cancelled.", parse_mode="HTML", reply_markup=admin_main_keyboard())
 
+
 @admin_broadcast_router.message(IsAdmin(), F.text == BTN_BROADCAST_CANCEL)
 async def cancel_broadcast_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("❌ Broadcast cancelled.", parse_mode="HTML", reply_markup=admin_main_keyboard())
 
+
 # ── Admin Force Join ───────────────────────────────────────────────────────────
 admin_force_join_router = Router(name="admin_force_join")
+
 
 class ForceJoinState(StatesGroup):
     waiting_channel_id = State()
     waiting_invite_link = State()
     waiting_remove_key = State()
 
+
 @admin_force_join_router.message(IsAdmin(), F.text == BTN_ADMIN_FORCE_JOIN)
 async def force_join_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("📌 <b>Force Join Manager</b>\n\nManage required join channels for bot access.", parse_mode="HTML", reply_markup=admin_force_join_keyboard())
+    await message.answer(
+        "📌 <b>Force Join Manager</b>\n\nManage required join channels for bot access.",
+        parse_mode="HTML", reply_markup=admin_force_join_keyboard(),
+    )
+
 
 @admin_force_join_router.message(IsAdmin(), F.text == BTN_VIEW_CHANNELS)
 async def view_channels(message: Message) -> None:
     channels = await get_all_force_join_channels()
     if not channels:
-        await message.answer("📭 <b>No channels configured.</b>\n\nAdd channels using ➕ Add Channel.", parse_mode="HTML", reply_markup=admin_force_join_keyboard())
+        await message.answer(
+            "📭 <b>No channels configured.</b>\n\nAdd channels using ➕ Add Channel.",
+            parse_mode="HTML", reply_markup=admin_force_join_keyboard(),
+        )
         return
     lines = [f"📌 <b>Force Join Channels ({len(channels)})</b>\n━━━━━━━━━━━━━━━━━━━\n"]
     for i, ch in enumerate(channels, 1):
@@ -1500,14 +1963,28 @@ async def view_channels(message: Message) -> None:
         channel_id = ch.get("channel_id", "")
         key = ch.get("_key", "")
         invite = ch.get("invite_link", "")
-        lines.append(f"\n<b>{i}.</b> {('@' + username) if username else channel_id}\n   🆔 ID: <code>{channel_id}</code>\n   📎 Key: <code>{key}</code>\n   🔗 Link: {invite or 'N/A'}\n   Status: {status}")
-    lines.append("\n━━━━━━━━━━━━━━━━━━━\n💡 Use key to enable/disable:\n  • <code>/enable_channel KEY</code>\n  • <code>/disable_channel KEY</code>")
+        lines.append(
+            f"\n<b>{i}.</b> {('@' + username) if username else channel_id}\n"
+            f"   🆔 ID: <code>{channel_id}</code>\n   📎 Key: <code>{key}</code>\n"
+            f"   🔗 Link: {invite or 'N/A'}\n   Status: {status}"
+        )
+    lines.append(
+        "\n━━━━━━━━━━━━━━━━━━━\n💡 Use key to enable/disable:\n"
+        "  • <code>/enable_channel KEY</code>\n  • <code>/disable_channel KEY</code>"
+    )
     await message.answer("".join(lines), parse_mode="HTML", reply_markup=admin_force_join_keyboard())
+
 
 @admin_force_join_router.message(IsAdmin(), F.text == BTN_ADD_CHANNEL)
 async def start_add_channel(message: Message, state: FSMContext) -> None:
     await state.set_state(ForceJoinState.waiting_channel_id)
-    await message.answer("➕ <b>Add Force Join Channel</b>\n\nStep 1/2: Send the channel ID or @username.\n\n<b>Examples:</b>\n  • <code>-1001234567890</code>\n  • <code>@mychannelname</code>\n\nPress 🔙 Back to abort.", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        "➕ <b>Add Force Join Channel</b>\n\nStep 1/2: Send the channel ID or @username.\n\n"
+        "<b>Examples:</b>\n  • <code>-1001234567890</code>\n  • <code>@mychannelname</code>\n\n"
+        "Press 🔙 Back to abort.",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_force_join_router.message(IsAdmin(), ForceJoinState.waiting_channel_id)
 async def receive_channel_id(message: Message, state: FSMContext) -> None:
@@ -1522,7 +1999,13 @@ async def receive_channel_id(message: Message, state: FSMContext) -> None:
     channel_username = channel_id.lstrip("@") if channel_id.startswith("@") else ""
     await state.update_data(channel_id=channel_id, channel_username=channel_username)
     await state.set_state(ForceJoinState.waiting_invite_link)
-    await message.answer("Step 2/2: Send the channel invite link.\n\n<b>Examples:</b>\n  • <code>https://t.me/mychannelname</code>\n  • <code>https://t.me/+ABCdefGHIjkl</code>\n\nPress 🔙 Back to abort.", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        "Step 2/2: Send the channel invite link.\n\n<b>Examples:</b>\n"
+        "  • <code>https://t.me/mychannelname</code>\n  • <code>https://t.me/+ABCdefGHIjkl</code>\n\n"
+        "Press 🔙 Back to abort.",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_force_join_router.message(IsAdmin(), ForceJoinState.waiting_invite_link)
 async def receive_invite_link(message: Message, state: FSMContext) -> None:
@@ -1534,11 +2017,23 @@ async def receive_invite_link(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await state.clear()
     user = message.from_user
-    ok = await add_force_join_channel(channel_id=data.get("channel_id", ""), channel_username=data.get("channel_username", ""), invite_link=invite_link, added_by=user.id if user else 0)
+    ok = await add_force_join_channel(
+        channel_id=data.get("channel_id", ""),
+        channel_username=data.get("channel_username", ""),
+        invite_link=invite_link,
+        added_by=user.id if user else 0,
+    )
     if ok:
-        await message.answer(f"✅ <b>Channel Added Successfully!</b>\n\n🆔 ID: <code>{data.get('channel_id', '')}</code>\n🔗 Link: {invite_link}\n\nUsers must now join this channel to use the bot.", parse_mode="HTML", reply_markup=admin_force_join_keyboard())
+        # Clear permission alert cache so new channel gets fresh check
+        _permission_alert_sent.discard(data.get("channel_id", ""))
+        await message.answer(
+            f"✅ <b>Channel Added Successfully!</b>\n\n🆔 ID: <code>{data.get('channel_id', '')}</code>\n"
+            f"🔗 Link: {invite_link}\n\nUsers must now join this channel to use the bot.",
+            parse_mode="HTML", reply_markup=admin_force_join_keyboard(),
+        )
     else:
         await message.answer("⚠️ Failed to add channel. Please try again.", parse_mode="HTML", reply_markup=admin_force_join_keyboard())
+
 
 @admin_force_join_router.message(IsAdmin(), F.text == BTN_REMOVE_CHANNEL)
 async def start_remove_channel(message: Message, state: FSMContext) -> None:
@@ -1557,6 +2052,7 @@ async def start_remove_channel(message: Message, state: FSMContext) -> None:
     lines.append("\nSend the <b>Key</b> of the channel to remove.")
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=admin_back_keyboard())
 
+
 @admin_force_join_router.message(IsAdmin(), ForceJoinState.waiting_remove_key)
 async def receive_remove_key(message: Message, state: FSMContext) -> None:
     if message.text == BTN_ADMIN_BACK:
@@ -1567,24 +2063,40 @@ async def receive_remove_key(message: Message, state: FSMContext) -> None:
     await state.clear()
     ok = await remove_force_join_channel(key)
     if ok:
-        await message.answer(f"✅ Channel <code>{key}</code> removed successfully.", parse_mode="HTML", reply_markup=admin_force_join_keyboard())
+        await message.answer(
+            f"✅ Channel <code>{key}</code> removed successfully.",
+            parse_mode="HTML", reply_markup=admin_force_join_keyboard(),
+        )
     else:
-        await message.answer(f"⚠️ Failed to remove channel <code>{key}</code>.", parse_mode="HTML", reply_markup=admin_force_join_keyboard())
+        await message.answer(
+            f"⚠️ Failed to remove channel <code>{key}</code>.",
+            parse_mode="HTML", reply_markup=admin_force_join_keyboard(),
+        )
+
 
 @admin_force_join_router.message(IsAdmin(), F.text.startswith("/enable_channel "))
 async def enable_channel(message: Message) -> None:
     key = (message.text or "").split(" ", 1)[1].strip()
     ok = await toggle_force_join_channel(key, True)
-    await message.answer(f"✅ Channel <code>{key}</code> enabled." if ok else f"⚠️ Failed to enable channel <code>{key}</code>.", parse_mode="HTML")
+    await message.answer(
+        f"✅ Channel <code>{key}</code> enabled." if ok else f"⚠️ Failed to enable channel <code>{key}</code>.",
+        parse_mode="HTML",
+    )
+
 
 @admin_force_join_router.message(IsAdmin(), F.text.startswith("/disable_channel "))
 async def disable_channel(message: Message) -> None:
     key = (message.text or "").split(" ", 1)[1].strip()
     ok = await toggle_force_join_channel(key, False)
-    await message.answer(f"🔴 Channel <code>{key}</code> disabled." if ok else f"⚠️ Failed to disable channel <code>{key}</code>.", parse_mode="HTML")
+    await message.answer(
+        f"🔴 Channel <code>{key}</code> disabled." if ok else f"⚠️ Failed to disable channel <code>{key}</code>.",
+        parse_mode="HTML",
+    )
+
 
 # ── Admin Statistics ───────────────────────────────────────────────────────────
 admin_statistics_router = Router(name="admin_statistics")
+
 
 @admin_statistics_router.message(IsAdmin(), F.text == BTN_ADMIN_STATISTICS)
 async def show_statistics(message: Message) -> None:
@@ -1612,8 +2124,10 @@ async def show_statistics(message: Message) -> None:
         logger.error("Statistics error: %s", e)
         await message.answer("⚠️ Failed to load statistics. Please try again.", parse_mode="HTML")
 
+
 # ── Admin Settings ─────────────────────────────────────────────────────────────
 admin_settings_router = Router(name="admin_settings")
+
 
 class SettingsState(StatesGroup):
     waiting_min_referrals = State()
@@ -1621,6 +2135,7 @@ class SettingsState(StatesGroup):
     waiting_welcome_msg = State()
     waiting_bot_name = State()
     waiting_reward_name = State()
+
 
 @admin_settings_router.message(IsAdmin(), F.text == BTN_ADMIN_SETTINGS)
 async def show_settings(message: Message, state: FSMContext) -> None:
@@ -1637,19 +2152,35 @@ async def show_settings(message: Message, state: FSMContext) -> None:
         f"📝 <b>Welcome Msg:</b>  {'Custom' if settings.get('welcome_message') else 'Default'}\n"
         f"🔧 <b>Maintenance:</b>  {maintenance_status}\n🟢 <b>Bot Status:</b>  {bot_status_label}\n━━━━━━━━━━━━━━━━━━━"
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=admin_settings_keyboard(maintenance=bool(settings.get("maintenance", False)), bot_status=bool(settings.get("bot_status", True))))
+    await message.answer(
+        text, parse_mode="HTML",
+        reply_markup=admin_settings_keyboard(
+            maintenance=bool(settings.get("maintenance", False)),
+            bot_status=bool(settings.get("bot_status", True)),
+        ),
+    )
+
 
 @admin_settings_router.message(IsAdmin(), F.text == "🔢 Min Referrals")
 async def set_min_referrals(message: Message, state: FSMContext) -> None:
     await state.set_state(SettingsState.waiting_min_referrals)
     settings = await get_settings()
-    await message.answer(f"🔢 <b>Change Minimum Referrals</b>\n\nCurrent: <b>{settings.get('minimum_referral', 10)}</b>\n\nSend the new minimum number (e.g. <code>10</code>).", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        f"🔢 <b>Change Minimum Referrals</b>\n\nCurrent: <b>{settings.get('minimum_referral', 10)}</b>\n\n"
+        f"Send the new minimum number (e.g. <code>10</code>).",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_settings_router.message(IsAdmin(), F.text == "⭐ Points Per Refer")
 async def set_points_per_refer(message: Message, state: FSMContext) -> None:
     await state.set_state(SettingsState.waiting_points_per_refer)
     settings = await get_settings()
-    await message.answer(f"⭐ <b>Points Per Referral</b>\n\nCurrent: <b>{settings.get('referral_reward', 1)} point(s)</b>\n\nSend the new value:", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        f"⭐ <b>Points Per Referral</b>\n\nCurrent: <b>{settings.get('referral_reward', 1)} point(s)</b>\n\nSend the new value:",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_settings_router.message(IsAdmin(), SettingsState.waiting_points_per_refer)
 async def receive_points_per_refer(message: Message, state: FSMContext) -> None:
@@ -1664,7 +2195,11 @@ async def receive_points_per_refer(message: Message, state: FSMContext) -> None:
     await state.clear()
     ok = await update_settings({"referral_reward": int(text)})
     kb = await _settings_keyboard_current()
-    await message.answer(f"✅ Points per referral set to <b>{text}</b>." if ok else "⚠️ Failed to update.", parse_mode="HTML", reply_markup=kb)
+    await message.answer(
+        f"✅ Points per referral set to <b>{text}</b>." if ok else "⚠️ Failed to update.",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
 
 @admin_settings_router.message(IsAdmin(), SettingsState.waiting_min_referrals)
 async def receive_min_referrals(message: Message, state: FSMContext) -> None:
@@ -1679,12 +2214,21 @@ async def receive_min_referrals(message: Message, state: FSMContext) -> None:
     await state.clear()
     ok = await update_settings({"minimum_referral": int(text)})
     kb = await _settings_keyboard_current()
-    await message.answer(f"✅ Minimum referrals set to <b>{text}</b>." if ok else "⚠️ Failed to update.", parse_mode="HTML", reply_markup=kb)
+    await message.answer(
+        f"✅ Minimum referrals set to <b>{text}</b>." if ok else "⚠️ Failed to update.",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
 
 @admin_settings_router.message(IsAdmin(), F.text == "📝 Welcome Msg")
 async def set_welcome_msg(message: Message, state: FSMContext) -> None:
     await state.set_state(SettingsState.waiting_welcome_msg)
-    await message.answer("📝 <b>Set Custom Welcome Message</b>\n\nSend the new welcome message.\nUse <code>{name}</code> to include the user's name.\n\nSend <code>default</code> to reset.", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        "📝 <b>Set Custom Welcome Message</b>\n\nSend the new welcome message.\n"
+        "Use <code>{name}</code> to include the user's name.\n\nSend <code>default</code> to reset.",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_settings_router.message(IsAdmin(), SettingsState.waiting_welcome_msg)
 async def receive_welcome_msg(message: Message, state: FSMContext) -> None:
@@ -1698,13 +2242,21 @@ async def receive_welcome_msg(message: Message, state: FSMContext) -> None:
     ok = await update_settings({"welcome_message": new_val})
     kb = await _settings_keyboard_current()
     label = "reset to default" if not new_val else "updated"
-    await message.answer(f"✅ Welcome message {label}." if ok else "⚠️ Failed to update.", parse_mode="HTML", reply_markup=kb)
+    await message.answer(
+        f"✅ Welcome message {label}." if ok else "⚠️ Failed to update.",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
 
 @admin_settings_router.message(IsAdmin(), F.text == "🤖 Bot Name")
 async def set_bot_name(message: Message, state: FSMContext) -> None:
     await state.set_state(SettingsState.waiting_bot_name)
     settings = await get_settings()
-    await message.answer(f"🤖 <b>Change Bot Name</b>\n\nCurrent: <b>{settings.get('bot_name', 'Bot')}</b>\n\nSend new name:", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        f"🤖 <b>Change Bot Name</b>\n\nCurrent: <b>{settings.get('bot_name', 'Bot')}</b>\n\nSend new name:",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_settings_router.message(IsAdmin(), SettingsState.waiting_bot_name)
 async def receive_bot_name(message: Message, state: FSMContext) -> None:
@@ -1719,13 +2271,21 @@ async def receive_bot_name(message: Message, state: FSMContext) -> None:
         return
     ok = await update_settings({"bot_name": name})
     kb = await _settings_keyboard_current()
-    await message.answer(f"✅ Bot name set to <b>{name}</b>." if ok else "⚠️ Failed to update.", parse_mode="HTML", reply_markup=kb)
+    await message.answer(
+        f"✅ Bot name set to <b>{name}</b>." if ok else "⚠️ Failed to update.",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
 
 @admin_settings_router.message(IsAdmin(), F.text == "🏆 Reward Name")
 async def set_reward_name(message: Message, state: FSMContext) -> None:
     await state.set_state(SettingsState.waiting_reward_name)
     settings = await get_settings()
-    await message.answer(f"🏆 <b>Change Reward Name</b>\n\nCurrent: <b>{settings.get('claim_reward_name', 'Telegram Premium')}</b>\n\nSend new name:", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        f"🏆 <b>Change Reward Name</b>\n\nCurrent: <b>{settings.get('claim_reward_name', 'Telegram Premium')}</b>\n\nSend new name:",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_settings_router.message(IsAdmin(), SettingsState.waiting_reward_name)
 async def receive_reward_name(message: Message, state: FSMContext) -> None:
@@ -1740,19 +2300,31 @@ async def receive_reward_name(message: Message, state: FSMContext) -> None:
         return
     ok = await update_settings({"claim_reward_name": name})
     kb = await _settings_keyboard_current()
-    await message.answer(f"✅ Reward name set to <b>{name}</b>." if ok else "⚠️ Failed to update.", parse_mode="HTML", reply_markup=kb)
+    await message.answer(
+        f"✅ Reward name set to <b>{name}</b>." if ok else "⚠️ Failed to update.",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
 
 @admin_settings_router.message(IsAdmin(), F.text == "🔧 Maintenance ON")
 async def maintenance_on(message: Message) -> None:
     ok = await update_settings({"maintenance": True})
     kb = admin_settings_keyboard(maintenance=True, bot_status=True)
-    await message.answer("🔧 <b>Maintenance mode ENABLED.</b>\n\nNormal users cannot use the bot until you turn it OFF." if ok else "⚠️ Failed to update.", parse_mode="HTML", reply_markup=kb)
+    await message.answer(
+        "🔧 <b>Maintenance mode ENABLED.</b>\n\nNormal users cannot use the bot until you turn it OFF." if ok else "⚠️ Failed to update.",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
 
 @admin_settings_router.message(IsAdmin(), F.text == "✅ Maintenance OFF")
 async def maintenance_off(message: Message) -> None:
     ok = await update_settings({"maintenance": False})
     kb = admin_settings_keyboard(maintenance=False, bot_status=True)
-    await message.answer("✅ <b>Maintenance mode DISABLED.</b>\n\nBot is now accessible to all users." if ok else "⚠️ Failed to update.", parse_mode="HTML", reply_markup=kb)
+    await message.answer(
+        "✅ <b>Maintenance mode DISABLED.</b>\n\nBot is now accessible to all users." if ok else "⚠️ Failed to update.",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
 
 @admin_settings_router.message(IsAdmin(), F.text == "🟢 Bot ON")
 async def bot_on(message: Message) -> None:
@@ -1760,11 +2332,16 @@ async def bot_on(message: Message) -> None:
     kb = admin_settings_keyboard(maintenance=False, bot_status=True)
     await message.answer("🟢 <b>Bot is now ON.</b>" if ok else "⚠️ Failed to update.", parse_mode="HTML", reply_markup=kb)
 
+
 @admin_settings_router.message(IsAdmin(), F.text == "🔴 Bot OFF")
 async def bot_off(message: Message) -> None:
     ok = await update_settings({"bot_status": False})
     kb = admin_settings_keyboard(maintenance=False, bot_status=False)
-    await message.answer("🔴 <b>Bot is now OFF.</b>\n\nOnly admins can use the bot." if ok else "⚠️ Failed to update.", parse_mode="HTML", reply_markup=kb)
+    await message.answer(
+        "🔴 <b>Bot is now OFF.</b>\n\nOnly admins can use the bot." if ok else "⚠️ Failed to update.",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
 
 @admin_settings_router.message(IsAdmin(), F.text.startswith("/block "))
 async def block_user_cmd(message: Message) -> None:
@@ -1774,7 +2351,11 @@ async def block_user_cmd(message: Message) -> None:
         return
     target_id = int(parts[1])
     ok = await block_user(target_id, message.from_user.id)
-    await message.answer(f"🚫 User <code>{target_id}</code> blocked." if ok else f"⚠️ Failed to block user <code>{target_id}</code>.", parse_mode="HTML")
+    await message.answer(
+        f"🚫 User <code>{target_id}</code> blocked." if ok else f"⚠️ Failed to block user <code>{target_id}</code>.",
+        parse_mode="HTML",
+    )
+
 
 @admin_settings_router.message(IsAdmin(), F.text.startswith("/unblock "))
 async def unblock_user_cmd(message: Message) -> None:
@@ -1784,19 +2365,29 @@ async def unblock_user_cmd(message: Message) -> None:
         return
     target_id = int(parts[1])
     ok = await unblock_user(target_id, message.from_user.id)
-    await message.answer(f"✅ User <code>{target_id}</code> unblocked." if ok else f"⚠️ Failed to unblock user <code>{target_id}</code>.", parse_mode="HTML")
+    await message.answer(
+        f"✅ User <code>{target_id}</code> unblocked." if ok else f"⚠️ Failed to unblock user <code>{target_id}</code>.",
+        parse_mode="HTML",
+    )
+
 
 # ── Admin Admins ───────────────────────────────────────────────────────────────
 admin_admins_router = Router(name="admin_admins")
+
 
 class AdminState(StatesGroup):
     waiting_add_id = State()
     waiting_remove_id = State()
 
+
 @admin_admins_router.message(IsAdmin(), F.text == BTN_ADMIN_ADMINS)
 async def admins_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("👑 <b>Admin Management</b>\n\nManage bot administrators.", parse_mode="HTML", reply_markup=admin_admins_keyboard())
+    await message.answer(
+        "👑 <b>Admin Management</b>\n\nManage bot administrators.",
+        parse_mode="HTML", reply_markup=admin_admins_keyboard(),
+    )
+
 
 @admin_admins_router.message(IsAdmin(), F.text == BTN_VIEW_ADMINS)
 async def view_admins(message: Message) -> None:
@@ -1812,10 +2403,16 @@ async def view_admins(message: Message) -> None:
         lines.append(f"\n<b>{i}.</b> {name} ({'@' + uname if uname else 'N/A'})\n   🆔 <code>{uid}</code>  {source}")
     await message.answer("".join(lines), parse_mode="HTML", reply_markup=admin_admins_keyboard())
 
+
 @admin_admins_router.message(IsAdmin(), F.text == BTN_ADD_ADMIN)
 async def start_add_admin(message: Message, state: FSMContext) -> None:
     await state.set_state(AdminState.waiting_add_id)
-    await message.answer("➕ <b>Add Admin</b>\n\nSend the Telegram User ID of the new admin.\n\n<b>Note:</b> The user must have started the bot.\nPress 🔙 Back to cancel.", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        "➕ <b>Add Admin</b>\n\nSend the Telegram User ID of the new admin.\n\n"
+        "<b>Note:</b> The user must have started the bot.\nPress 🔙 Back to cancel.",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_admins_router.message(IsAdmin(), AdminState.waiting_add_id)
 async def receive_add_admin_id(message: Message, state: FSMContext) -> None:
@@ -1834,15 +2431,22 @@ async def receive_add_admin_id(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ You cannot add yourself as admin.", reply_markup=admin_admins_keyboard())
         return
     if await is_admin(target_id):
-        await message.answer(f"⚠️ User <code>{target_id}</code> is already an admin.", parse_mode="HTML", reply_markup=admin_admins_keyboard())
+        await message.answer(
+            f"⚠️ User <code>{target_id}</code> is already an admin.",
+            parse_mode="HTML", reply_markup=admin_admins_keyboard(),
+        )
         return
     ok = await add_admin(target_id, sender_id)
     if ok:
         db_user = await get_user(target_id)
         name = db_user.get("full_name", str(target_id)) if db_user else str(target_id)
-        await message.answer(f"✅ <b>Admin Added</b>\n\n👤 {name}\n🆔 <code>{target_id}</code>", parse_mode="HTML", reply_markup=admin_admins_keyboard())
+        await message.answer(
+            f"✅ <b>Admin Added</b>\n\n👤 {name}\n🆔 <code>{target_id}</code>",
+            parse_mode="HTML", reply_markup=admin_admins_keyboard(),
+        )
     else:
         await message.answer("⚠️ Failed to add admin.", reply_markup=admin_admins_keyboard())
+
 
 @admin_admins_router.message(IsAdmin(), F.text == BTN_REMOVE_ADMIN)
 async def start_remove_admin(message: Message, state: FSMContext) -> None:
@@ -1850,7 +2454,10 @@ async def start_remove_admin(message: Message, state: FSMContext) -> None:
     env_admins = config.get_initial_admin_ids()
     removable = [uid for uid in admin_ids if uid not in env_admins]
     if not removable:
-        await message.answer("⚠️ No removable admins. Environment admins cannot be removed here.", parse_mode="HTML", reply_markup=admin_admins_keyboard())
+        await message.answer(
+            "⚠️ No removable admins. Environment admins cannot be removed here.",
+            parse_mode="HTML", reply_markup=admin_admins_keyboard(),
+        )
         return
     await state.set_state(AdminState.waiting_remove_id)
     lines = ["➖ <b>Remove Admin</b>\n\nRemovable admins:\n"]
@@ -1860,6 +2467,7 @@ async def start_remove_admin(message: Message, state: FSMContext) -> None:
         lines.append(f"  • <code>{uid}</code> — {name}")
     lines.append("\nSend the <b>User ID</b> to remove:")
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=admin_back_keyboard())
+
 
 @admin_admins_router.message(IsAdmin(), AdminState.waiting_remove_id)
 async def receive_remove_admin_id(message: Message, state: FSMContext) -> None:
@@ -1879,10 +2487,15 @@ async def receive_remove_admin_id(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ Cannot remove environment-configured admins.", reply_markup=admin_admins_keyboard())
         return
     ok = await remove_admin(target_id, sender_id)
-    await message.answer(f"✅ Admin <code>{target_id}</code> removed." if ok else "⚠️ Failed to remove admin.", parse_mode="HTML", reply_markup=admin_admins_keyboard())
+    await message.answer(
+        f"✅ Admin <code>{target_id}</code> removed." if ok else "⚠️ Failed to remove admin.",
+        parse_mode="HTML", reply_markup=admin_admins_keyboard(),
+    )
+
 
 # ── Admin Users ────────────────────────────────────────────────────────────────
 admin_users_router = Router(name="admin_users")
+
 
 class UserMgmtState(StatesGroup):
     waiting_block_id = State()
@@ -1891,15 +2504,24 @@ class UserMgmtState(StatesGroup):
     waiting_points_amount = State()
     waiting_view_id = State()
 
+
 @admin_users_router.message(IsAdmin(), F.text == BTN_ADMIN_USERS)
 async def users_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("👥 <b>User Management</b>\n\nBlock, unblock users or edit their points.", parse_mode="HTML", reply_markup=admin_users_keyboard())
+    await message.answer(
+        "👥 <b>User Management</b>\n\nBlock, unblock users or edit their points.",
+        parse_mode="HTML", reply_markup=admin_users_keyboard(),
+    )
+
 
 @admin_users_router.message(IsAdmin(), F.text == "🚫 Block User")
 async def start_block(message: Message, state: FSMContext) -> None:
     await state.set_state(UserMgmtState.waiting_block_id)
-    await message.answer("🚫 <b>Block User</b>\n\nSend the <b>User ID</b> to block.\nPress 🔙 Back to cancel.", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        "🚫 <b>Block User</b>\n\nSend the <b>User ID</b> to block.\nPress 🔙 Back to cancel.",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_users_router.message(IsAdmin(), UserMgmtState.waiting_block_id)
 async def do_block(message: Message, state: FSMContext) -> None:
@@ -1916,23 +2538,37 @@ async def do_block(message: Message, state: FSMContext) -> None:
     await state.clear()
     db_user = await get_user(target_id)
     if not db_user:
-        await message.answer(f"⚠️ User <code>{target_id}</code> not found.", parse_mode="HTML", reply_markup=admin_users_keyboard())
+        await message.answer(
+            f"⚠️ User <code>{target_id}</code> not found.",
+            parse_mode="HTML", reply_markup=admin_users_keyboard(),
+        )
         return
     if db_user.get("blocked"):
-        await message.answer(f"⚠️ User <code>{target_id}</code> is already blocked.", parse_mode="HTML", reply_markup=admin_users_keyboard())
+        await message.answer(
+            f"⚠️ User <code>{target_id}</code> is already blocked.",
+            parse_mode="HTML", reply_markup=admin_users_keyboard(),
+        )
         return
     ok = await block_user(target_id, sender_id)
     if ok:
         name = db_user.get("full_name", str(target_id))
         uname = db_user.get("username", "")
-        await message.answer(f"🚫 <b>User Blocked</b>\n\n👤 {name} {'(@' + uname + ')' if uname else ''}\n🆔 <code>{target_id}</code>", parse_mode="HTML", reply_markup=admin_users_keyboard())
+        await message.answer(
+            f"🚫 <b>User Blocked</b>\n\n👤 {name} {'(@' + uname + ')' if uname else ''}\n🆔 <code>{target_id}</code>",
+            parse_mode="HTML", reply_markup=admin_users_keyboard(),
+        )
     else:
         await message.answer("⚠️ Failed to block user.", reply_markup=admin_users_keyboard())
+
 
 @admin_users_router.message(IsAdmin(), F.text == "✅ Unblock User")
 async def start_unblock(message: Message, state: FSMContext) -> None:
     await state.set_state(UserMgmtState.waiting_unblock_id)
-    await message.answer("✅ <b>Unblock User</b>\n\nSend the <b>User ID</b> to unblock.\nPress 🔙 Back to cancel.", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        "✅ <b>Unblock User</b>\n\nSend the <b>User ID</b> to unblock.\nPress 🔙 Back to cancel.",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_users_router.message(IsAdmin(), UserMgmtState.waiting_unblock_id)
 async def do_unblock(message: Message, state: FSMContext) -> None:
@@ -1949,23 +2585,37 @@ async def do_unblock(message: Message, state: FSMContext) -> None:
     await state.clear()
     db_user = await get_user(target_id)
     if not db_user:
-        await message.answer(f"⚠️ User <code>{target_id}</code> not found.", parse_mode="HTML", reply_markup=admin_users_keyboard())
+        await message.answer(
+            f"⚠️ User <code>{target_id}</code> not found.",
+            parse_mode="HTML", reply_markup=admin_users_keyboard(),
+        )
         return
     if not db_user.get("blocked"):
-        await message.answer(f"⚠️ User <code>{target_id}</code> is not blocked.", parse_mode="HTML", reply_markup=admin_users_keyboard())
+        await message.answer(
+            f"⚠️ User <code>{target_id}</code> is not blocked.",
+            parse_mode="HTML", reply_markup=admin_users_keyboard(),
+        )
         return
     ok = await unblock_user(target_id, sender_id)
     if ok:
         name = db_user.get("full_name", str(target_id))
         uname = db_user.get("username", "")
-        await message.answer(f"✅ <b>User Unblocked</b>\n\n👤 {name} {'(@' + uname + ')' if uname else ''}\n🆔 <code>{target_id}</code>", parse_mode="HTML", reply_markup=admin_users_keyboard())
+        await message.answer(
+            f"✅ <b>User Unblocked</b>\n\n👤 {name} {'(@' + uname + ')' if uname else ''}\n🆔 <code>{target_id}</code>",
+            parse_mode="HTML", reply_markup=admin_users_keyboard(),
+        )
     else:
         await message.answer("⚠️ Failed to unblock user.", reply_markup=admin_users_keyboard())
+
 
 @admin_users_router.message(IsAdmin(), F.text == "⭐ Edit Points")
 async def start_edit_points(message: Message, state: FSMContext) -> None:
     await state.set_state(UserMgmtState.waiting_points_user_id)
-    await message.answer("⭐ <b>Edit User Points</b>\n\nStep 1/2: Send the <b>User ID</b>.\nPress 🔙 Back to cancel.", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        "⭐ <b>Edit User Points</b>\n\nStep 1/2: Send the <b>User ID</b>.\nPress 🔙 Back to cancel.",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_users_router.message(IsAdmin(), UserMgmtState.waiting_points_user_id)
 async def receive_points_user_id(message: Message, state: FSMContext) -> None:
@@ -1986,7 +2636,14 @@ async def receive_points_user_id(message: Message, state: FSMContext) -> None:
     name = db_user.get("full_name", str(target_id))
     await state.update_data(target_id=target_id, current_points=current_points)
     await state.set_state(UserMgmtState.waiting_points_amount)
-    await message.answer(f"⭐ <b>Edit Points</b>\n\n👤 <b>User:</b> {name}\n🆔 <b>ID:</b> <code>{target_id}</code>\n⭐ <b>Current Points:</b> {current_points}\n\n━━━━━━━━━━━━━━━━━━━\nStep 2/2: Send amount.\n\n<b>Examples:</b>\n  • <code>+5</code> → add 5\n  • <code>-3</code> → subtract 3\n  • <code>10</code> → set to 10\n\nPress 🔙 Back to cancel.", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        f"⭐ <b>Edit Points</b>\n\n👤 <b>User:</b> {name}\n🆔 <b>ID:</b> <code>{target_id}</code>\n"
+        f"⭐ <b>Current Points:</b> {current_points}\n\n━━━━━━━━━━━━━━━━━━━\n"
+        f"Step 2/2: Send amount.\n\n<b>Examples:</b>\n  • <code>+5</code> → add 5\n"
+        f"  • <code>-3</code> → subtract 3\n  • <code>10</code> → set to 10\n\nPress 🔙 Back to cancel.",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_users_router.message(IsAdmin(), UserMgmtState.waiting_points_amount)
 async def do_edit_points(message: Message, state: FSMContext) -> None:
@@ -2011,22 +2668,34 @@ async def do_edit_points(message: Message, state: FSMContext) -> None:
         new_points = int(raw)
         op_str = f"set to {new_points}"
     else:
-        await message.answer("⚠️ Invalid format. Use <code>+5</code>, <code>-3</code>, or <code>10</code>.", parse_mode="HTML")
+        await message.answer(
+            "⚠️ Invalid format. Use <code>+5</code>, <code>-3</code>, or <code>10</code>.",
+            parse_mode="HTML",
+        )
         return
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, fb_update, f"users/{target_id}", {"referral_points": new_points})
     _user_cache.pop(f"user_{target_id}", None)
     if ok:
         db_user = await get_user(target_id)
         name = db_user.get("full_name", str(target_id)) if db_user else str(target_id)
-        await message.answer(f"✅ <b>Points Updated!</b>\n\n👤 <b>User:</b> {name}\n🆔 <b>ID:</b> <code>{target_id}</code>\n📝 <b>Operation:</b> {op_str}\n⭐ <b>Before:</b> {current_points}\n⭐ <b>After:</b> {new_points}", parse_mode="HTML", reply_markup=admin_users_keyboard())
+        await message.answer(
+            f"✅ <b>Points Updated!</b>\n\n👤 <b>User:</b> {name}\n🆔 <b>ID:</b> <code>{target_id}</code>\n"
+            f"📝 <b>Operation:</b> {op_str}\n⭐ <b>Before:</b> {current_points}\n⭐ <b>After:</b> {new_points}",
+            parse_mode="HTML", reply_markup=admin_users_keyboard(),
+        )
     else:
         await message.answer("⚠️ Failed to update points.", reply_markup=admin_users_keyboard())
+
 
 @admin_users_router.message(IsAdmin(), F.text == "🔍 View User")
 async def start_view_user(message: Message, state: FSMContext) -> None:
     await state.set_state(UserMgmtState.waiting_view_id)
-    await message.answer("🔍 <b>View User Info</b>\n\nSend the <b>User ID</b> to look up.\nPress 🔙 Back to cancel.", parse_mode="HTML", reply_markup=admin_back_keyboard())
+    await message.answer(
+        "🔍 <b>View User Info</b>\n\nSend the <b>User ID</b> to look up.\nPress 🔙 Back to cancel.",
+        parse_mode="HTML", reply_markup=admin_back_keyboard(),
+    )
+
 
 @admin_users_router.message(IsAdmin(), UserMgmtState.waiting_view_id)
 async def do_view_user(message: Message, state: FSMContext) -> None:
@@ -2042,7 +2711,10 @@ async def do_view_user(message: Message, state: FSMContext) -> None:
     await state.clear()
     db_user = await get_user(target_id)
     if not db_user:
-        await message.answer(f"⚠️ User <code>{target_id}</code> not found.", parse_mode="HTML", reply_markup=admin_users_keyboard())
+        await message.answer(
+            f"⚠️ User <code>{target_id}</code> not found.",
+            parse_mode="HTML", reply_markup=admin_users_keyboard(),
+        )
         return
     name = db_user.get("full_name", "Unknown")
     uname = db_user.get("username", "")
@@ -2063,14 +2735,123 @@ async def do_view_user(message: Message, state: FSMContext) -> None:
         parse_mode="HTML", reply_markup=admin_users_keyboard(),
     )
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE AUDIT
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def audit_force_join_channels(bot: Bot) -> None:
+    """
+    Startup audit: checks all configured force-join channels for issues.
+    Logs warnings for duplicates, empty IDs, and bot permission problems.
+    Does NOT remove channels automatically — just alerts.
+    """
+    logger.info("=== Force-Join Channel Audit Starting ===")
+    channels = await get_all_force_join_channels()
+    if not channels:
+        logger.info("Audit: No force-join channels configured.")
+        return
+
+    seen_ids: Dict[str, str] = {}  # channel_id → key (for duplicate detection)
+    issues_found = 0
+
+    for ch in channels:
+        key = ch.get("_key", "?")
+        cid = ch.get("channel_id", "")
+        uname = ch.get("channel_username", "")
+        invite = ch.get("invite_link", "")
+        status = ch.get("status", True)
+
+        # Check for empty channel ID
+        if not cid:
+            logger.warning("Audit: Channel with key=%s has EMPTY channel_id — skipped in checks.", key)
+            issues_found += 1
+            continue
+
+        # Check for duplicates
+        if cid in seen_ids:
+            logger.warning(
+                "Audit: DUPLICATE channel_id=%s found (keys: %s and %s).", cid, seen_ids[cid], key
+            )
+            issues_found += 1
+        else:
+            seen_ids[cid] = key
+
+        # Check invite link validity (basic)
+        if invite and not (invite.startswith("https://t.me/") or invite.startswith("http://t.me/")):
+            logger.warning("Audit: Channel key=%s has suspicious invite_link=%s", key, invite)
+            issues_found += 1
+
+        if not status:
+            logger.info("Audit: Channel key=%s (id=%s) is DISABLED — skip active check.", key, cid)
+            continue
+
+        # Verify bot can check membership in this channel
+        try:
+            # Use bot.get_chat to check channel accessibility
+            chat = await bot.get_chat(chat_id=cid)
+            logger.info(
+                "Audit: Channel key=%s id=%s title=%s — accessible ✅", key, cid, chat.title
+            )
+        except TelegramRetryAfter as e:
+            logger.warning("Audit: FloodWait for channel=%s — skipping check for now.", cid)
+        except TelegramForbiddenError as e:
+            logger.error(
+                "Audit: Bot FORBIDDEN in channel=%s (key=%s): %s — bot needs to be admin!", cid, key, e
+            )
+            issues_found += 1
+        except TelegramBadRequest as e:
+            err = str(e).lower()
+            if "chat not found" in err or "invalid" in err:
+                logger.error(
+                    "Audit: Channel=%s (key=%s) appears INVALID or DELETED: %s", cid, key, e
+                )
+            else:
+                logger.warning("Audit: TelegramBadRequest for channel=%s: %s", cid, e)
+            issues_found += 1
+        except Exception as e:
+            logger.warning("Audit: Could not check channel=%s: %s", cid, e)
+
+    if issues_found:
+        logger.warning("=== Audit COMPLETE — %d issue(s) found. Review logs above. ===", issues_found)
+        # Notify admins about audit issues
+        admin_ids = await get_all_admin_ids()
+        alert = (
+            f"⚠️ <b>Bot Startup — Force-Join Channel Audit</b>\n\n"
+            f"Found <b>{issues_found} issue(s)</b> with configured channels.\n"
+            f"Check bot logs for details and fix any invalid/inaccessible channels."
+        )
+        for admin_id in admin_ids:
+            try:
+                await bot.send_message(chat_id=admin_id, text=alert, parse_mode="HTML")
+            except Exception:
+                pass
+    else:
+        logger.info("=== Audit COMPLETE — All %d channel(s) look healthy. ===", len(channels))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BOT STARTUP / SHUTDOWN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def create_dispatcher() -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
+
+    # Middleware order (applied in registration order):
+    # 1. ThrottlingMiddleware — rate limiting (messages only)
+    # 2. AuthMiddleware      — bot status / maintenance / blocked check (messages only)
+    # 3. ForcedJoinMiddleware — membership gating (messages AND callbacks)
+    #
+    # ForcedJoinMiddleware is registered LAST so throttle/auth run first.
+    # This prevents API calls for spamming or blocked users.
+    forced_join_mw = ForcedJoinMiddleware()
+
     dp.message.middleware(ThrottlingMiddleware())
     dp.message.middleware(AuthMiddleware())
+    dp.message.middleware(forced_join_mw)
+    dp.callback_query.middleware(forced_join_mw)  # Also gates callbacks
+
+    # Admin routers first (more specific filters)
     dp.include_router(admin_dashboard_router)
     dp.include_router(admin_requests_router)
     dp.include_router(admin_broadcast_router)
@@ -2079,16 +2860,20 @@ def create_dispatcher() -> Dispatcher:
     dp.include_router(admin_settings_router)
     dp.include_router(admin_admins_router)
     dp.include_router(admin_users_router)
+
+    # User routers
     dp.include_router(start_router)
     dp.include_router(user_router)
     dp.include_router(referral_router)
     dp.include_router(premium_router)
+
     return dp
 
+
 async def on_startup(bot: Bot) -> None:
-    logger.info("=" * 55)
-    logger.info("  Telegram Premium Referral Bot Starting...")
-    logger.info("=" * 55)
+    logger.info("=" * 60)
+    logger.info("  Telegram Premium Referral Bot — Hardened Version")
+    logger.info("=" * 60)
     try:
         initialize_firebase()
         logger.info("✅ Firebase connected.")
@@ -2107,17 +2892,32 @@ async def on_startup(bot: Bot) -> None:
         logger.error("Failed to load admins: %s", e)
     try:
         settings = await get_settings()
-        logger.info("✅ Settings loaded: min_referral=%s maintenance=%s", settings.get("minimum_referral"), settings.get("maintenance"))
+        logger.info(
+            "✅ Settings loaded: min_referral=%s maintenance=%s",
+            settings.get("minimum_referral"),
+            settings.get("maintenance"),
+        )
     except Exception as e:
         logger.error("Failed to load settings: %s", e)
-    logger.info("=" * 55)
+
+    # Run channel audit on every startup
+    try:
+        await audit_force_join_channels(bot)
+    except Exception as e:
+        logger.error("Channel audit failed: %s", e)
+
+    logger.info("=" * 60)
+    logger.info("  ForcedJoinMiddleware: ACTIVE (applied to all updates)")
+    logger.info("  Error policy: FAIL-CLOSED (deny on uncertainty)")
     logger.info("  Bot is ready and accepting messages!")
-    logger.info("=" * 55)
+    logger.info("=" * 60)
+
 
 async def on_shutdown(bot: Bot) -> None:
     logger.info("Bot is shutting down...")
     await bot.session.close()
     logger.info("Bot stopped.")
+
 
 async def run_polling() -> None:
     bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -2126,9 +2926,14 @@ async def run_polling() -> None:
     dp.shutdown.register(on_shutdown)
     logger.info("Starting in POLLING mode...")
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), drop_pending_updates=True)
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+            drop_pending_updates=True,
+        )
     finally:
         await bot.session.close()
+
 
 async def run_webhook() -> None:
     if not config.WEBHOOK_HOST:
@@ -2140,7 +2945,11 @@ async def run_webhook() -> None:
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
     webhook_url = f"{config.WEBHOOK_HOST}{config.WEBHOOK_PATH}"
-    await bot.set_webhook(url=webhook_url, allowed_updates=dp.resolve_used_update_types(), drop_pending_updates=True)
+    await bot.set_webhook(
+        url=webhook_url,
+        allowed_updates=dp.resolve_used_update_types(),
+        drop_pending_updates=True,
+    )
     logger.info("Webhook set: %s", webhook_url)
     app = web.Application()
     handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
@@ -2157,6 +2966,7 @@ async def run_webhook() -> None:
         await runner.cleanup()
         await bot.session.close()
 
+
 def main() -> None:
     try:
         config.validate()
@@ -2167,6 +2977,7 @@ def main() -> None:
         asyncio.run(run_polling())
     else:
         asyncio.run(run_webhook())
+
 
 if __name__ == "__main__":
     main()
